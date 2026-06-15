@@ -1,0 +1,6863 @@
+/**
+ * Integration tests for ModalEditor key sequences.
+ *
+ * Smoke matrix: ~30+ scenarios covering the full command surface.
+ * Table-driven style used wherever the pattern is uniform; explicit `it`
+ * blocks where state inspection requires nuance.
+ */
+
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { describe, it } from "node:test";
+import { CURSOR_MARKER, visibleWidth } from "@mariozechner/pi-tui";
+import installPiVim, { ModalEditor } from "../index.js";
+import type { WordMotionClass } from "../motions.js";
+import { setPiVimSettingsReaderForTests } from "../settings.js";
+import type {
+  WordMotionDirection,
+  WordMotionTarget,
+} from "../word-boundary-cache.js";
+import {
+  createCursorShapeTui,
+  createEditorWithSpy,
+  createExtensionApiHarness,
+  createMultiLineEditor,
+  sendKeys,
+  stubKeybindings,
+  stubTheme,
+  stubTui,
+} from "./harness.js";
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+type ModalEditorWordBoundaryCacheInternals = {
+  tryFindTarget(
+    line: string,
+    col: number,
+    direction: WordMotionDirection,
+    target: WordMotionTarget,
+    semanticClass?: WordMotionClass,
+  ): number | null;
+};
+
+type ModalEditorTestInternals = {
+  tryFindWordTargetLineLocal?: (
+    direction: WordMotionDirection,
+    target: WordMotionTarget,
+    semanticClass?: WordMotionClass,
+  ) => number | null;
+  findWordTargetInText(
+    text: string,
+    abs: number,
+    direction: "forward" | "backward",
+    target: "start" | "end",
+    count?: number,
+    semanticClass?: WordMotionClass,
+  ): number;
+  wordBoundaryCache: ModalEditorWordBoundaryCacheInternals;
+  state?: unknown;
+  pushUndoSnapshot?: (() => void) | undefined;
+};
+
+type FindWordTargetInTextArgs = Parameters<
+  ModalEditorTestInternals["findWordTargetInText"]
+>;
+type TryFindTargetArgs = Parameters<
+  ModalEditorWordBoundaryCacheInternals["tryFindTarget"]
+>;
+
+type EditorFactory = (
+  tui: ConstructorParameters<typeof ModalEditor>[0],
+  theme: ConstructorParameters<typeof ModalEditor>[1],
+  keybindings: ConstructorParameters<typeof ModalEditor>[2],
+) => ModalEditor;
+type Theme = ConstructorParameters<typeof ModalEditor>[1];
+
+type NotificationCall = { message: string; type: string };
+type ThemeFgCall = { token: string; text: string };
+
+function getRawEditor(editor: ModalEditor): ModalEditorTestInternals {
+  return editor as unknown as ModalEditorTestInternals;
+}
+
+const INSERT_CURSOR_SHAPE = "\x1b[5 q";
+const BLOCK_CURSOR_SHAPE = "\x1b[1 q";
+const RESET_CURSOR_SHAPE = "\x1b[0 q";
+const SOFTWARE_CURSOR_SPACE = "\x1b[7m \x1b[0m";
+/* eslint-disable-next-line no-control-regex */
+const DECSCUSR_PATTERN = /\x1b\[[015] q/;
+
+function focusEditor(editor: ModalEditor): void {
+  editor.focused = true;
+}
+
+type WrapperFacingEditor = ModalEditor & {
+  actionHandlers: Map<string, unknown>;
+  onSubmit: (text: string) => unknown;
+  onChange: (text: string) => unknown;
+  onEscape: () => unknown;
+  onCtrlD: () => unknown;
+  onExtensionShortcut: (shortcut: string) => unknown;
+  focused: boolean;
+  disableSubmit: boolean;
+  borderColor: (text: string) => string;
+};
+
+const WRAPPER_FACING_METHODS = [
+  "handleInput",
+  "render",
+  "invalidate",
+  "getText",
+  "setText",
+  "insertTextAtCursor",
+  "getExpandedText",
+  "addToHistory",
+  "setAutocompleteProvider",
+  "setPaddingX",
+  "setAutocompleteMaxVisible",
+  "getLines",
+  "getCursor",
+  "getMode",
+  "onAction",
+] as const satisfies readonly (keyof WrapperFacingEditor)[];
+
+const WRAPPER_FACING_FIELDS = [
+  "onSubmit",
+  "onChange",
+  "onEscape",
+  "onCtrlD",
+  "onExtensionShortcut",
+  "actionHandlers",
+  "focused",
+  "disableSubmit",
+  "borderColor",
+] as const satisfies readonly (keyof WrapperFacingEditor)[];
+
+type DecoratedCall =
+  | { method: "insertTextAtCursor"; text: string }
+  | { method: "handleInput"; data: string }
+  | { method: "setText"; text: string };
+
+function assertWrapperFacingSurface(
+  editor: ModalEditor,
+): asserts editor is WrapperFacingEditor {
+  const candidate = editor as WrapperFacingEditor;
+
+  for (const method of WRAPPER_FACING_METHODS) {
+    assert.equal(
+      typeof candidate[method],
+      "function",
+      `${method} should be a function`,
+    );
+  }
+
+  for (const field of WRAPPER_FACING_FIELDS) {
+    assert.ok(field in candidate, `${field} should exist`);
+  }
+
+  assert.ok(
+    candidate.actionHandlers instanceof Map,
+    "actionHandlers should be a Map",
+  );
+  assert.equal(
+    typeof candidate.focused,
+    "boolean",
+    "focused should be a boolean",
+  );
+  assert.equal(
+    typeof candidate.disableSubmit,
+    "boolean",
+    "disableSubmit should be a boolean",
+  );
+  assert.equal(
+    typeof candidate.borderColor,
+    "function",
+    "borderColor should be a function",
+  );
+}
+
+function decorateInPlace(editor: ModalEditor): DecoratedCall[] {
+  assertWrapperFacingSurface(editor);
+  const calls: DecoratedCall[] = [];
+  const originalInsertTextAtCursor = editor.insertTextAtCursor.bind(editor);
+  const originalHandleInput = editor.handleInput.bind(editor);
+  const originalSetText = editor.setText.bind(editor);
+
+  editor.insertTextAtCursor = (text: string) => {
+    calls.push({ method: "insertTextAtCursor", text });
+    return originalInsertTextAtCursor(text);
+  };
+  editor.handleInput = (data: string) => {
+    calls.push({ method: "handleInput", data });
+    return originalHandleInput(data);
+  };
+  editor.setText = (text: string) => {
+    calls.push({ method: "setText", text });
+    return originalSetText(text);
+  };
+
+  return calls;
+}
+
+function findCursorMarkerLine(lines: string[]): string {
+  const line = lines.find((line) => line.includes(CURSOR_MARKER));
+  assert.ok(line, "expected rendered lines to include CURSOR_MARKER");
+  return line;
+}
+
+function removeCursorMarker(line: string): string {
+  return line.replace(CURSOR_MARKER, "");
+}
+
+function assertNoCursorShapeSequences(lines: string[]): void {
+  for (const line of lines) {
+    assert.doesNotMatch(line, DECSCUSR_PATTERN);
+  }
+}
+
+function setInternalCursor(
+  editor: ModalEditor,
+  cursorCol: number,
+  cursorLine: number = 0,
+): void {
+  const internal = editor as unknown as {
+    state?: { cursorLine?: number; cursorCol?: number };
+    preferredVisualCol?: number | null;
+    lastAction?: string | null;
+    tui?: { requestRender?: () => void };
+  };
+
+  if (!internal.state) {
+    throw new Error("ModalEditor test internal state unavailable");
+  }
+
+  internal.state.cursorLine = cursorLine;
+  internal.state.cursorCol = cursorCol;
+  internal.preferredVisualCol = null;
+  internal.lastAction = null;
+  internal.tui?.requestRender?.();
+}
+
+type InstalledExtension = {
+  editorFactory: EditorFactory;
+  readonly notificationCalls: number;
+  readonly notifications: NotificationCall[];
+  readonly shutdownCalls: number;
+  emitShutdown(): Promise<void>;
+  readonly sessionShutdownHandlerCount: number;
+  readonly sessionEndHandlerCount: number;
+};
+
+function createRecordingTheme(
+  rejectedTokens: readonly string[] = [],
+): Theme & { fgCalls: ThemeFgCall[] } {
+  const fgCalls: ThemeFgCall[] = [];
+  const rejected = new Set(rejectedTokens);
+  return {
+    borderColor: (s: string) => s,
+    fg: (token: string, text: string) => {
+      fgCalls.push({ token, text });
+      if (rejected.has(token)) {
+        throw new Error(`unknown theme token: ${token}`);
+      }
+      return `<${token}>${text}</${token}>`;
+    },
+    bold: (s: string) => s,
+    fgCalls,
+  } as unknown as Theme & { fgCalls: ThemeFgCall[] };
+}
+
+async function installExtensionWithEditorFactory(
+  theme: Theme = stubTheme,
+): Promise<InstalledExtension> {
+  const pi = createExtensionApiHarness();
+  let editorFactory: EditorFactory | null = null;
+  let notificationCalls = 0;
+  const notifications: NotificationCall[] = [];
+  let shutdownCalls = 0;
+  const ctx = {
+    cwd: process.cwd(),
+    hasUI: true,
+    ui: {
+      theme,
+      setEditorComponent(factory: EditorFactory): void {
+        editorFactory = factory;
+      },
+      notify(message: string, type: string): void {
+        notificationCalls++;
+        notifications.push({ message, type });
+      },
+    },
+    shutdown(): void {
+      shutdownCalls++;
+    },
+  };
+
+  installPiVim(pi);
+  await pi.emit("session_start", undefined, ctx);
+
+  if (!editorFactory) {
+    throw new Error("expected session_start to install an editor factory");
+  }
+
+  return {
+    editorFactory,
+    get notificationCalls() {
+      return notificationCalls;
+    },
+    get notifications() {
+      return notifications;
+    },
+    get shutdownCalls() {
+      return shutdownCalls;
+    },
+    async emitShutdown(): Promise<void> {
+      await pi.emit("session_shutdown", undefined, ctx);
+    },
+    get sessionShutdownHandlerCount() {
+      return pi.handlersFor("session_shutdown").length;
+    },
+    get sessionEndHandlerCount() {
+      return pi.handlersFor("session_end").length;
+    },
+  };
+}
+
+function createSpawnErrno(message: string): Error {
+  const error = new Error(message) as NodeJS.ErrnoException;
+  error.code = "ENOENT";
+  error.syscall = "spawn clipboard-helper";
+  return error;
+}
+
+function deferred(): {
+  promise: Promise<void>;
+  resolve: () => void;
+} {
+  let resolve: (() => void) | undefined;
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = () => resolvePromise();
+  });
+
+  if (resolve === undefined) {
+    throw new Error("deferred promise was not initialized");
+  }
+
+  return { promise, resolve };
+}
+
+function nextImmediate(): Promise<void> {
+  return new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+  });
+}
+
+type HelperRunResult = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+};
+
+const CLIPBOARD_HELPER_TEST_TIMEOUT_MS = 5_000;
+
+async function getClipboardHelperSourceWithMock(
+  mockModuleSource: string,
+): Promise<string> {
+  const indexSource = await readFile(
+    new URL("../index.ts", import.meta.url),
+    "utf8",
+  );
+  const match = /const CLIPBOARD_HELPER_SOURCE = `([\s\S]*?)`;/.exec(
+    indexSource,
+  );
+
+  assert.ok(match, "CLIPBOARD_HELPER_SOURCE not found");
+  assert.ok(match[1], "CLIPBOARD_HELPER_SOURCE was empty");
+
+  const mockModuleUrl = `data:text/javascript,${encodeURIComponent(mockModuleSource)}`;
+  const helperImportLine = [
+    "import { copyToClipboard } from ",
+    "$",
+    "{JSON.stringify(PI_CODING_AGENT_MODULE_URL)};",
+  ].join("");
+  const replacementImportLine = `import { copyToClipboard } from ${JSON.stringify(mockModuleUrl)};`;
+  const helperSource = match[1];
+
+  assert.equal(
+    helperSource.includes(helperImportLine),
+    true,
+    "clipboard helper import not found",
+  );
+
+  const mockedSource = helperSource.replace(
+    helperImportLine,
+    replacementImportLine,
+  );
+
+  assert.notEqual(
+    mockedSource,
+    helperSource,
+    "clipboard helper import was not replaced",
+  );
+  assert.equal(
+    mockedSource.includes(helperImportLine),
+    false,
+    "real clipboard helper import remains",
+  );
+  assert.equal(
+    mockedSource.includes(replacementImportLine),
+    true,
+    "mock clipboard import missing",
+  );
+
+  return mockedSource;
+}
+
+async function getClipboardReadHelperSourceWithMock(
+  mockClipboardExpression: string,
+): Promise<string> {
+  const indexSource = await readFile(
+    new URL("../index.ts", import.meta.url),
+    "utf8",
+  );
+  const match = /const CLIPBOARD_READ_HELPER_SOURCE = `([\s\S]*?)`;/.exec(
+    indexSource,
+  );
+
+  assert.ok(match, "CLIPBOARD_READ_HELPER_SOURCE not found");
+  assert.ok(match[1], "CLIPBOARD_READ_HELPER_SOURCE was empty");
+
+  const requireLine = [
+    "const require = createRequire(",
+    "$",
+    "{JSON.stringify(PI_CODING_AGENT_MODULE_URL)});",
+  ].join("");
+  const clipboardLine = 'const clipboard = require("@mariozechner/clipboard");';
+  const replacement = `const clipboard = ${mockClipboardExpression};`;
+  const helperSource = match[1];
+  const mockedSource = helperSource.replace(
+    `${requireLine}\n${clipboardLine}`,
+    replacement,
+  );
+
+  assert.notEqual(
+    mockedSource,
+    helperSource,
+    "clipboard read helper require was not replaced",
+  );
+  assert.equal(
+    mockedSource.includes(clipboardLine),
+    false,
+    "real clipboard read helper require remains",
+  );
+  assert.equal(
+    mockedSource.includes(replacement),
+    true,
+    "mock clipboard object missing",
+  );
+
+  return mockedSource;
+}
+
+function runClipboardHelperSource(
+  source: string,
+  input: string,
+): Promise<HelperRunResult> {
+  return new Promise<HelperRunResult>((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      ["--input-type=module", "-e", source],
+      {
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let settled = false;
+
+    function finish(error: unknown, result?: HelperRunResult): void {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+
+      if (error) {
+        reject(error);
+        return;
+      }
+      if (result === undefined) {
+        reject(new Error("clipboard helper result missing"));
+        return;
+      }
+
+      resolve(result);
+    }
+
+    const timeoutId = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Best effort: the timeout already fails the helper-source test.
+      }
+      finish(
+        new Error(
+          `clipboard helper timed out after ${CLIPBOARD_HELPER_TEST_TIMEOUT_MS}ms`,
+        ),
+      );
+    }, CLIPBOARD_HELPER_TEST_TIMEOUT_MS);
+
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      stdoutChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      stderrChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+    });
+    child.once("error", (error) => finish(error));
+    child.once("close", (code, signal) => {
+      finish(null, {
+        code,
+        signal,
+        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+      });
+    });
+
+    child.stdin.end(input);
+  });
+}
+
+/** Run keys on a fresh single-line editor and check text + optional register. */
+function chk(
+  initial: string,
+  keys: string[],
+  expectedText: string,
+  expectedRegister?: string,
+): void {
+  const { editor } = createEditorWithSpy(initial);
+  sendKeys(editor, keys);
+  assert.equal(editor.getText(), expectedText, `text after [${keys.join("")}]`);
+  if (expectedRegister !== undefined) {
+    assert.equal(
+      editor.getRegister(),
+      expectedRegister,
+      `register after [${keys.join("")}]`,
+    );
+  }
+}
+
+/** Run keys on a fresh editor and check mode. */
+function chkMode(
+  initial: string,
+  keys: string[],
+  expectedMode: "normal" | "insert",
+): void {
+  const { editor } = createEditorWithSpy(initial);
+  sendKeys(editor, keys);
+  assert.equal(editor.getMode(), expectedMode, `mode after [${keys.join("")}]`);
+}
+
+function assertRedoRoundTrip(options: {
+  initial: string;
+  keys: string[];
+  expectedText: string;
+  expectedCursor: { line: number; col: number };
+  expectedRegister: string;
+  multiLine?: boolean;
+  before?: (editor: ReturnType<typeof createEditorWithSpy>["editor"]) => void;
+}): void {
+  const {
+    initial,
+    keys,
+    expectedText,
+    expectedCursor,
+    expectedRegister,
+    multiLine = false,
+    before,
+  } = options;
+  const { editor } = multiLine
+    ? createMultiLineEditor(initial)
+    : createEditorWithSpy(initial);
+
+  before?.(editor);
+  sendKeys(editor, keys);
+
+  assert.equal(editor.getText(), expectedText, `text after [${keys.join("")}]`);
+  assert.deepEqual(
+    editor.getCursor(),
+    expectedCursor,
+    `cursor after [${keys.join("")}]`,
+  );
+  assert.equal(
+    editor.getRegister(),
+    expectedRegister,
+    `register after [${keys.join("")}]`,
+  );
+
+  sendKeys(editor, ["u", "\x12"]);
+
+  assert.equal(
+    editor.getText(),
+    expectedText,
+    `redo text after [${keys.join("")}]`,
+  );
+  assert.deepEqual(
+    editor.getCursor(),
+    expectedCursor,
+    `redo cursor after [${keys.join("")}]`,
+  );
+  assert.equal(
+    editor.getRegister(),
+    expectedRegister,
+    `redo register after [${keys.join("")}]`,
+  );
+}
+
+function makeGeneratedLineFixtures(count: number): string[] {
+  let seed = 0x51f15eed;
+  const next = (): number => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return seed;
+  };
+
+  const words = ["alpha", "beta_2", "GAMMA", "z9", "m_n"];
+  const punct = ["-", "--", "::", ".", ",", "!?", "#"];
+  const spaces = [" ", "  ", "   ", "\t"];
+  const fixtures = ["", "   ", "---", "a", "a   b", "foo--bar"];
+  const pick = (values: readonly string[]): string =>
+    values[next() % values.length] ?? "";
+
+  for (let i = 0; i < count; i++) {
+    const parts: string[] = [];
+    const partCount = 1 + (next() % 6);
+
+    for (let part = 0; part < partCount; part++) {
+      const bucket = next() % 5;
+      if (bucket <= 1) {
+        parts.push(pick(words));
+      } else if (bucket === 2) {
+        parts.push(pick(punct));
+      } else {
+        parts.push(pick(spaces));
+      }
+    }
+
+    fixtures.push(parts.join(""));
+  }
+
+  return fixtures;
+}
+
+function runScenario(
+  initial: string,
+  keys: string[],
+  mode: "fast" | "canonical",
+): {
+  text: string;
+  register: string;
+  editorMode: "normal" | "insert";
+  cursorLine: number;
+  cursorCol: number;
+} {
+  const { editor } = initial.includes("\n")
+    ? createMultiLineEditor(initial)
+    : createEditorWithSpy(initial);
+
+  if (mode === "canonical") {
+    getRawEditor(editor).tryFindWordTargetLineLocal = () => null;
+  }
+
+  sendKeys(editor, keys);
+
+  const cursor = editor.getCursor();
+
+  return {
+    text: editor.getText(),
+    register: editor.getRegister(),
+    editorMode: editor.getMode(),
+    cursorLine: cursor.line,
+    cursorCol: cursor.col,
+  };
+}
+
+function createEditorAtBufferEnd(text: string): ModalEditor {
+  const editor = new ModalEditor(stubTui, stubTheme, stubKeybindings);
+
+  for (const char of text) {
+    editor.handleInput(char);
+  }
+
+  editor.handleInput("\x1b");
+
+  return editor;
+}
+
+function assertInsertBorderAfterModeChangingCommand(
+  fixtureText: string,
+  commandKeys: string[],
+): void {
+  const editor = new ModalEditor(stubTui, stubTheme, stubKeybindings, {
+    borderColorizers: {
+      insert: (s: string) => `<insert>${s}</insert>`,
+      normal: (s: string) => `<normal>${s}</normal>`,
+      ex: (s: string) => `<ex>${s}</ex>`,
+    },
+  });
+
+  for (const char of fixtureText) {
+    editor.handleInput(char);
+  }
+  editor.handleInput("\x1b");
+
+  sendKeys(editor, commandKeys);
+
+  assert.equal(
+    editor.getMode(),
+    "insert",
+    `mode after [${commandKeys.join("")}]`,
+  );
+  assert.equal(
+    editor.borderColor("x"),
+    "<insert>x</insert>",
+    `border after [${commandKeys.join("")}]`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Wrapper-facing editor surface
+// ---------------------------------------------------------------------------
+
+describe("wrapper-facing editor surface", () => {
+  it("exposes the CustomEditor-style surface later decorators need", () => {
+    const editor = new ModalEditor(stubTui, stubTheme, stubKeybindings);
+
+    assertWrapperFacingSurface(editor);
+  });
+
+  it("keeps modal behavior when a later decorator patches core methods in place", () => {
+    const editor = new ModalEditor(stubTui, stubTheme, stubKeybindings);
+    const calls = decorateInPlace(editor);
+
+    editor.insertTextAtCursor("abc");
+    assert.equal(editor.getText(), "abc");
+
+    editor.setText("hello");
+    assert.equal(editor.getText(), "hello");
+
+    editor.handleInput("!");
+    assert.equal(editor.getText(), "hello!");
+    assert.equal(editor.getMode(), "insert");
+
+    editor.handleInput("\x1b");
+    assert.equal(editor.getMode(), "normal");
+
+    editor.handleInput("0");
+    editor.handleInput("x");
+    assert.equal(editor.getText(), "ello!");
+    assert.equal(editor.getMode(), "normal");
+
+    assert.deepEqual(calls, [
+      { method: "insertTextAtCursor", text: "abc" },
+      { method: "setText", text: "hello" },
+      { method: "handleInput", data: "!" },
+      { method: "handleInput", data: "\x1b" },
+      { method: "handleInput", data: "0" },
+      { method: "handleInput", data: "x" },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mode transitions
+// ---------------------------------------------------------------------------
+
+describe("mode transitions", () => {
+  it("escape enters normal mode", () => {
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["i"]);
+    assert.equal(editor.getMode(), "insert");
+    sendKeys(editor, ["\x1b"]);
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("kitty ctrl+[ enters normal mode like escape", () => {
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["i"]);
+    assert.equal(editor.getMode(), "insert");
+    sendKeys(editor, ["\x1b[91;5u"]);
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("i enters insert mode from normal", () => {
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["i"]);
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("escape in normal mode stays in normal (passes raw esc upward)", () => {
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["\x1b"]);
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("kitty ctrl+[ in normal mode forwards escape upward", () => {
+    const { editor } = createEditorWithSpy("hello");
+
+    const customEditorProto = Object.getPrototypeOf(
+      Object.getPrototypeOf(editor),
+    );
+    const originalHandleInput = customEditorProto.handleInput;
+    let forwardedEscapeCount = 0;
+
+    customEditorProto.handleInput = function (
+      this: unknown,
+      data: string,
+    ): unknown {
+      if (data === "\x1b") forwardedEscapeCount++;
+      return originalHandleInput.call(this, data);
+    };
+
+    try {
+      sendKeys(editor, ["\x1b[91;5u"]);
+      assert.equal(editor.getMode(), "normal");
+      assert.equal(forwardedEscapeCount, 1);
+    } finally {
+      customEditorProto.handleInput = originalHandleInput;
+    }
+  });
+
+  it("a at EOL on non-last line appends on same line", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+    sendKeys(editor, ["$", "a", "X"]);
+    assert.equal(editor.getText(), "fooX\nbar");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("normal mode ignores printable unicode input", () => {
+    const { editor } = createEditorWithSpy("abc");
+    sendKeys(editor, ["😀"]);
+    assert.equal(editor.getText(), "abc");
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("normal mode ignores pasted printable chunks", () => {
+    const { editor } = createEditorWithSpy("abc");
+    sendKeys(editor, ["xyz"]);
+    assert.equal(editor.getText(), "abc");
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("normal mode does not treat prototype keys as mappings", () => {
+    const { editor } = createEditorWithSpy("abc");
+
+    assert.doesNotThrow(() => sendKeys(editor, ["toString"]));
+    assert.equal(editor.getText(), "abc");
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("normal mode ignores bracketed paste payload", () => {
+    const { editor } = createEditorWithSpy("abc");
+    sendKeys(editor, ["\x1b[200~PASTE\x1b[201~"]);
+    assert.equal(editor.getText(), "abc");
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("insert-mode submit key inserts a newline instead of submitting", () => {
+    const editor = new ModalEditor(stubTui, stubTheme, stubKeybindings);
+    let submitted: string | null = null;
+    editor.onSubmit = (text) => {
+      submitted = text;
+    };
+
+    sendKeys(editor, ["h", "e", "l", "l", "o", "\r", "w", "o", "r", "l", "d"]);
+
+    assert.equal(editor.getText(), "hello\nworld");
+    assert.equal(editor.getMode(), "insert");
+    assert.equal(submitted, null);
+  });
+
+  it("normal-mode submit key still submits the prompt", () => {
+    const { editor } = createEditorWithSpy("hello");
+    let submitted: string | null = null;
+    editor.onSubmit = (text) => {
+      submitted = text;
+    };
+
+    sendKeys(editor, ["\r"]);
+
+    assert.equal(submitted, "hello");
+    assert.equal(editor.getText(), "");
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("insert mode keeps bracketed paste payload text", () => {
+    const { editor } = createEditorWithSpy("abc");
+    sendKeys(editor, ["i", "\x1b[200~PASTE\x1b[201~"]);
+    assert.equal(editor.getText(), "PASTEabc");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("escape from insert clears unterminated bracketed paste state", () => {
+    const { editor } = createEditorWithSpy("abc");
+
+    sendKeys(editor, ["i", "\x1b[200~", "\x1b", "l", "x"]);
+
+    assert.equal(editor.getMode(), "normal");
+    assert.equal(editor.getText(), "ac");
+    assert.equal(editor.getRegister(), "b");
+  });
+
+  it("I enters insert at first non-whitespace char", () => {
+    const { editor } = createMultiLineEditor("   hello");
+    // move to end of line
+    sendKeys(editor, ["$"]);
+    // I should go to first non-ws (col 3)
+    sendKeys(editor, ["I"]);
+    assert.strictEqual(editor.getMode(), "insert");
+    assert.strictEqual(editor.getCursor().col, 3);
+  });
+
+  it("I on line with no leading whitespace goes to col 0", () => {
+    const { editor } = createMultiLineEditor("hello");
+    sendKeys(editor, ["$"]);
+    sendKeys(editor, ["I"]);
+    assert.strictEqual(editor.getMode(), "insert");
+    assert.strictEqual(editor.getCursor().col, 0);
+  });
+});
+
+describe("ex mini-mode", () => {
+  it("renders the pending EX command and consumes prefixed counts", () => {
+    const session = createEditorWithSpy("hello");
+
+    sendKeys(session.editor, ["2", ":"]);
+
+    assert.ok(session.editor.render(80).at(-1)?.endsWith(" EX :_ "));
+
+    sendKeys(session.editor, ["\x1b", "x"]);
+
+    assert.equal(session.quitCalls, 0);
+    assert.equal(session.editor.getMode(), "normal");
+    assert.equal(session.editor.getText(), "ello");
+    assert.equal(session.editor.getRegister(), "h");
+  });
+
+  it("keeps the EX label visible on narrow renders", () => {
+    const session = createEditorWithSpy("hello");
+
+    sendKeys(session.editor, [":", ...Array.from("averyveryverylongcommand")]);
+
+    const footer = session.editor.render(20).at(-1) ?? "";
+
+    assert.ok(footer.includes(" EX "));
+    assert.ok(footer.endsWith("_ "));
+  });
+
+  it("renders EX labels with the EX-specific colorizer", () => {
+    const calls: string[] = [];
+    const colorizers = {
+      insert: (s: string) => {
+        calls.push(`insert:${s}`);
+        return `\x1b[32m${s}\x1b[39m`;
+      },
+      normal: (s: string) => {
+        calls.push(`normal:${s}`);
+        return `\x1b[34m${s}\x1b[39m`;
+      },
+      ex: (s: string) => {
+        calls.push(`ex:${s}`);
+        return `\x1b[35m${s}\x1b[39m`;
+      },
+    };
+    const editor = new ModalEditor(stubTui, stubTheme, stubKeybindings, {
+      labelColorizers: colorizers,
+    });
+
+    editor.handleInput("\x1b");
+    sendKeys(editor, [":"]);
+
+    const footer = editor.render(80).at(-1) ?? "";
+
+    assert.deepEqual(calls, ["ex: EX :_ "]);
+    assert.ok(footer.includes(" EX :_ "));
+    assert.ok(footer.endsWith("\x1b[35m EX :_ \x1b[39m"));
+  });
+
+  it(":q refuses to quit when prompt has non-whitespace text", () => {
+    const session = createEditorWithSpy("hello");
+
+    sendKeys(session.editor, [":", "q", "\r"]);
+
+    assert.equal(session.quitCalls, 0);
+    assert.equal(session.editor.getMode(), "normal");
+    assert.equal(session.editor.getText(), "hello");
+    assert.deepEqual(session.editor.getCursor(), { line: 0, col: 0 });
+    assert.deepEqual(session.notifications, [
+      "Prompt is not empty; use :q! to quit anyway",
+    ]);
+  });
+
+  it(":qa refuses to quit when prompt has non-whitespace text", () => {
+    const session = createEditorWithSpy("hello");
+
+    sendKeys(session.editor, [":", "q", "a", "\r"]);
+
+    assert.equal(session.quitCalls, 0);
+    assert.equal(session.editor.getText(), "hello");
+    assert.deepEqual(session.notifications, [
+      "Prompt is not empty; use :qa! to quit anyway",
+    ]);
+  });
+
+  it(":q requests quit when prompt is empty", () => {
+    const session = createEditorWithSpy("");
+
+    sendKeys(session.editor, [":", "q", "\r"]);
+
+    assert.equal(session.quitCalls, 1);
+    assert.equal(session.editor.getText(), "");
+    assert.deepEqual(session.notifications, []);
+  });
+
+  it(":qa requests quit when prompt is whitespace-only", () => {
+    const session = createEditorWithSpy("   ");
+
+    sendKeys(session.editor, [":", "q", "a", "\r"]);
+
+    assert.equal(session.quitCalls, 1);
+    assert.equal(session.editor.getText(), "   ");
+    assert.deepEqual(session.notifications, []);
+  });
+
+  it(":qa! requests quit when prompt has non-whitespace text", () => {
+    const session = createEditorWithSpy("hello");
+
+    sendKeys(session.editor, [":", "q", "a", "!", "\r"]);
+
+    assert.equal(session.quitCalls, 1);
+    assert.equal(session.editor.getText(), "hello");
+    assert.deepEqual(session.notifications, []);
+  });
+
+  it("escape cancels ex mini-mode", () => {
+    const session = createEditorWithSpy("hello");
+
+    sendKeys(session.editor, [":", "q", "\x1b", "x"]);
+
+    assert.equal(session.quitCalls, 0);
+    assert.equal(session.editor.getText(), "ello");
+    assert.equal(session.editor.getRegister(), "h");
+  });
+
+  it("backspace edits the pending ex command", () => {
+    const session = createEditorWithSpy("");
+
+    sendKeys(session.editor, [":", "q", "a", "\x7f", "\r"]);
+
+    assert.equal(session.quitCalls, 1);
+    assert.deepEqual(session.notifications, []);
+  });
+
+  it("ctrl+h edits the pending ex command", () => {
+    const session = createEditorWithSpy("");
+
+    sendKeys(session.editor, [":", "q", "a", "\x08", "\r"]);
+
+    assert.equal(session.quitCalls, 1);
+    assert.deepEqual(session.notifications, []);
+  });
+
+  it("backspace removes one full grapheme from the pending ex command", () => {
+    const session = createEditorWithSpy("");
+
+    sendKeys(session.editor, [":", "e\u0301", "\x7f", "q", "\r"]);
+
+    assert.equal(session.quitCalls, 1);
+    assert.deepEqual(session.notifications, []);
+    assert.equal(session.editor.getText(), "");
+  });
+
+  it(":q! requests quit when prompt has non-whitespace text", () => {
+    const session = createEditorWithSpy("hello");
+
+    sendKeys(session.editor, [":", "q", "!", "\r"]);
+
+    assert.equal(session.quitCalls, 1);
+    assert.equal(session.editor.getText(), "hello");
+    assert.deepEqual(session.notifications, []);
+  });
+
+  it("bracketed paste payload is accepted in ex mini-mode", () => {
+    const session = createEditorWithSpy("hello");
+
+    sendKeys(session.editor, [":", "\x1b[200~q!\x1b[201~", "\r"]);
+
+    assert.equal(session.quitCalls, 1);
+    assert.equal(session.editor.getMode(), "normal");
+    assert.equal(session.editor.getText(), "hello");
+    assert.deepEqual(session.notifications, []);
+  });
+
+  it("split bracketed paste payload is accepted in ex mini-mode", () => {
+    const session = createEditorWithSpy("hello");
+
+    sendKeys(session.editor, [
+      ":",
+      "\x1b[200~",
+      "q",
+      "a",
+      "!",
+      "\x1b",
+      "[201~",
+      "\r",
+    ]);
+
+    assert.equal(session.quitCalls, 1);
+    assert.equal(session.editor.getMode(), "normal");
+    assert.equal(session.editor.getText(), "hello");
+    assert.deepEqual(session.notifications, []);
+  });
+
+  it("newline in bracketed paste submits the pending ex command", () => {
+    const session = createEditorWithSpy("hello");
+
+    sendKeys(session.editor, [":", "\x1b[200~q!\n\x1b[201~"]);
+
+    assert.equal(session.quitCalls, 1);
+    assert.equal(session.editor.getMode(), "normal");
+    assert.equal(session.editor.getText(), "hello");
+    assert.deepEqual(session.notifications, []);
+  });
+
+  it("newline submit in split bracketed paste discards the trailing paste marker", () => {
+    const session = createEditorWithSpy("hello");
+    const customEditorProto = Object.getPrototypeOf(
+      Object.getPrototypeOf(session.editor),
+    );
+    const originalHandleInput = customEditorProto.handleInput;
+    let forwardedEscapeCount = 0;
+
+    customEditorProto.handleInput = function (
+      this: unknown,
+      data: string,
+    ): unknown {
+      if (data === "\x1b") forwardedEscapeCount++;
+      return originalHandleInput.call(this, data);
+    };
+
+    try {
+      sendKeys(session.editor, [":", "\x1b[200~q!\n", "\x1b", "[201~", "x"]);
+
+      assert.equal(session.quitCalls, 1);
+      assert.equal(forwardedEscapeCount, 0);
+      assert.equal(session.editor.getMode(), "normal");
+      assert.equal(session.editor.getText(), "ello");
+      assert.equal(session.editor.getRegister(), "h");
+      assert.deepEqual(session.notifications, []);
+    } finally {
+      customEditorProto.handleInput = originalHandleInput;
+    }
+  });
+
+  it("empty submit is a silent no-op", () => {
+    const session = createEditorWithSpy("hello");
+
+    sendKeys(session.editor, [":", "\r"]);
+
+    assert.equal(session.quitCalls, 0);
+    assert.deepEqual(session.notifications, []);
+    assert.equal(session.editor.getMode(), "normal");
+    assert.equal(session.editor.getText(), "hello");
+  });
+
+  it("backspace on bare colon exits ex mode", () => {
+    const session = createEditorWithSpy("hello");
+
+    sendKeys(session.editor, [":", "\x7f", "x"]);
+
+    assert.equal(session.quitCalls, 0);
+    assert.equal(session.editor.getMode(), "normal");
+    assert.equal(session.editor.getText(), "ello");
+    assert.equal(session.editor.getRegister(), "h");
+  });
+
+  it("non-printable input cancels ex mode and is reprocessed", () => {
+    const session = createEditorWithSpy("hello");
+
+    sendKeys(session.editor, ["x", "u", ":", "q", "\x12"]);
+
+    assert.equal(session.quitCalls, 0);
+    assert.deepEqual(session.notifications, []);
+    assert.equal(session.editor.getMode(), "normal");
+    assert.equal(session.editor.getText(), "ello");
+    assert.equal(session.editor.getRegister(), "h");
+  });
+
+  it("unsupported ex commands do not quit", () => {
+    const session = createEditorWithSpy("hello");
+
+    sendKeys(session.editor, ["l", "l", ":", "w", "q", "\r"]);
+
+    assert.equal(session.quitCalls, 0);
+    assert.deepEqual(session.notifications, ["Unsupported ex command: :wq"]);
+    assert.equal(session.editor.getText(), "hello");
+    assert.deepEqual(session.editor.getCursor(), { line: 0, col: 2 });
+  });
+});
+
+describe("clipboard mirror policy settings", () => {
+  it("applies clipboardMirror=never from settings", async () => {
+    const restore = setPiVimSettingsReaderForTests(() => ({
+      clipboardMirror: "never",
+    }));
+
+    try {
+      const extension = await installExtensionWithEditorFactory();
+      const editor = extension.editorFactory(
+        stubTui,
+        stubTheme,
+        stubKeybindings,
+      );
+
+      assert.equal(editor.getClipboardMirrorPolicy(), "never");
+      assert.equal(extension.notificationCalls, 0);
+    } finally {
+      restore();
+    }
+  });
+
+  it("falls back to all and warns for invalid clipboardMirror", async () => {
+    const restore = setPiVimSettingsReaderForTests(() => ({
+      clipboardMirror: "delete",
+    }));
+
+    try {
+      const extension = await installExtensionWithEditorFactory();
+      const editor = extension.editorFactory(
+        stubTui,
+        stubTheme,
+        stubKeybindings,
+      );
+
+      assert.equal(editor.getClipboardMirrorPolicy(), "all");
+      assert.equal(extension.notificationCalls, 1);
+      assert.equal(extension.notifications.length, 1);
+
+      const notification = extension.notifications[0];
+      assert.ok(notification, "expected warning notification");
+      assert.equal(notification.type, "warning");
+      assert.match(notification.message, /delete/);
+      assert.match(notification.message, /all, yank, never/);
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("mode color settings", () => {
+  const reverseInsertLabel = "\x1b[48;2;255;255;255;1;7m INSERT \x1b[27;22;49m";
+
+  it("mode label uses default insert, normal, and EX mode color tokens", async () => {
+    const theme = createRecordingTheme();
+    const restore = setPiVimSettingsReaderForTests(() => ({}));
+
+    try {
+      const extension = await installExtensionWithEditorFactory(theme);
+      const editor = extension.editorFactory(
+        stubTui,
+        stubTheme,
+        stubKeybindings,
+      );
+
+      editor.render(80);
+      sendKeys(editor, ["\x1b"]);
+      editor.render(80);
+      sendKeys(editor, [":"]);
+      editor.render(80);
+
+      assert.deepEqual(
+        theme.fgCalls.map((call) => call.token),
+        ["magenta", "normalBlue", "warning"],
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("mode label uses a custom insert mode color token", async () => {
+    const theme = createRecordingTheme();
+    const restore = setPiVimSettingsReaderForTests(() => ({
+      modeColors: { insert: "primary" },
+    }));
+
+    try {
+      const extension = await installExtensionWithEditorFactory(theme);
+      const editor = extension.editorFactory(
+        stubTui,
+        stubTheme,
+        stubKeybindings,
+      );
+
+      editor.render(80);
+
+      assert.deepEqual(theme.fgCalls, [
+        { token: "primary", text: reverseInsertLabel },
+      ]);
+    } finally {
+      restore();
+    }
+  });
+
+  it("mode label partial mode color overrides preserve default tokens", async () => {
+    const theme = createRecordingTheme();
+    const restore = setPiVimSettingsReaderForTests(() => ({
+      modeColors: { insert: "primary" },
+    }));
+
+    try {
+      const extension = await installExtensionWithEditorFactory(theme);
+      const editor = extension.editorFactory(
+        stubTui,
+        stubTheme,
+        stubKeybindings,
+      );
+
+      editor.render(80);
+      sendKeys(editor, ["\x1b"]);
+      editor.render(80);
+      sendKeys(editor, [":"]);
+      editor.render(80);
+
+      assert.deepEqual(
+        theme.fgCalls.map((call) => call.token),
+        ["primary", "normalBlue", "warning"],
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("mode label falls back when the EX mode color token is unknown", async () => {
+    const theme = createRecordingTheme(["unknownToken"]);
+    const restore = setPiVimSettingsReaderForTests(() => ({
+      modeColors: { ex: "unknownToken" },
+    }));
+
+    try {
+      const extension = await installExtensionWithEditorFactory(theme);
+      const editor = extension.editorFactory(
+        stubTui,
+        stubTheme,
+        stubKeybindings,
+      );
+
+      sendKeys(editor, ["\x1b", ":"]);
+
+      assert.doesNotThrow(() => editor.render(80));
+      assert.deepEqual(
+        theme.fgCalls.map((call) => call.token),
+        ["unknownToken", "warning"],
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("mode label falls back to ANSI color code when default magenta color token is unknown/throws in theme", async () => {
+    const theme = createRecordingTheme(["magenta"]);
+    const restore = setPiVimSettingsReaderForTests(() => ({}));
+
+    try {
+      const extension = await installExtensionWithEditorFactory(theme);
+      const editor = extension.editorFactory(
+        stubTui,
+        stubTheme,
+        stubKeybindings,
+      );
+
+      const lines = editor.render(80);
+      const footer = lines.at(-1) ?? "";
+
+      assert.deepEqual(
+        theme.fgCalls.map((call) => call.token),
+        ["magenta"],
+      );
+      assert.ok(footer.includes("\x1b[38;2;255;0;255m"));
+      assert.ok(footer.includes(reverseInsertLabel));
+      assert.ok(
+        footer.includes(`\x1b[38;2;255;0;255m${reverseInsertLabel}\x1b[39m`),
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("mode label passes reverse-video text to theme.fg", async () => {
+    const theme = createRecordingTheme();
+    const restore = setPiVimSettingsReaderForTests(() => ({}));
+
+    try {
+      const extension = await installExtensionWithEditorFactory(theme);
+      const editor = extension.editorFactory(
+        stubTui,
+        stubTheme,
+        stubKeybindings,
+      );
+
+      editor.render(80);
+
+      assert.deepEqual(theme.fgCalls, [
+        { token: "magenta", text: reverseInsertLabel },
+      ]);
+    } finally {
+      restore();
+    }
+  });
+
+  for (const [name, settings] of [
+    ["absent", {}],
+    ["false", { syncBorderColorWithMode: false }],
+  ] as const) {
+    it(`syncBorderColorWithMode ${name} keeps the original border color reference`, async () => {
+      const theme = createRecordingTheme();
+      const restore = setPiVimSettingsReaderForTests(() => settings);
+
+      try {
+        const extension = await installExtensionWithEditorFactory(theme);
+        const editor = extension.editorFactory(
+          stubTui,
+          stubTheme,
+          stubKeybindings,
+        );
+        const originalBorderColor = editor.borderColor;
+
+        sendKeys(editor, ["\x1b", ":", "\x1b", "i"]);
+
+        assert.equal(editor.borderColor, originalBorderColor);
+      } finally {
+        restore();
+      }
+    });
+  }
+
+  it("syncBorderColorWithMode true syncs border color across core transitions", async () => {
+    const theme = createRecordingTheme();
+    const restore = setPiVimSettingsReaderForTests(() => ({
+      modeColors: {
+        insert: "insertToken",
+        normal: "normalToken",
+        ex: "exToken",
+      },
+      syncBorderColorWithMode: true,
+    }));
+
+    try {
+      const extension = await installExtensionWithEditorFactory(theme);
+      const editor = extension.editorFactory(
+        stubTui,
+        stubTheme,
+        stubKeybindings,
+      );
+      const originalBorderColor = editor.borderColor;
+
+      assert.equal(
+        editor.borderColor("border"),
+        "<insertToken>border</insertToken>",
+      );
+
+      sendKeys(editor, ["\x1b"]);
+      assert.equal(
+        editor.borderColor("border"),
+        "<normalToken>border</normalToken>",
+      );
+
+      sendKeys(editor, [":"]);
+      assert.equal(editor.borderColor("border"), "<exToken>border</exToken>");
+
+      sendKeys(editor, ["\x1b"]);
+      assert.equal(
+        editor.borderColor("border"),
+        "<normalToken>border</normalToken>",
+      );
+
+      sendKeys(editor, ["i"]);
+      assert.equal(
+        editor.borderColor("border"),
+        "<insertToken>border</insertToken>",
+      );
+      assert.equal(editor.borderColor, originalBorderColor);
+    } finally {
+      restore();
+    }
+  });
+
+  it("syncBorderColorWithMode true survives Pi host borderColor assignment", async () => {
+    const theme = createRecordingTheme();
+    const restore = setPiVimSettingsReaderForTests(() => ({
+      modeColors: {
+        insert: "insertToken",
+        normal: "normalToken",
+        ex: "exToken",
+      },
+      syncBorderColorWithMode: true,
+    }));
+
+    try {
+      const extension = await installExtensionWithEditorFactory(theme);
+      const editor = extension.editorFactory(
+        stubTui,
+        stubTheme,
+        stubKeybindings,
+      );
+      const defaultEditorBorderColor = (text: string) =>
+        `<hostBorder>${text}</hostBorder>`;
+
+      // Pi's InteractiveMode.setCustomEditorComponent copies the default
+      // editor's borderColor onto the extension editor after the factory
+      // returns. The mode-aware border hook must survive that assignment.
+      editor.borderColor = defaultEditorBorderColor;
+      assert.equal(
+        editor.borderColor("border"),
+        "<insertToken>border</insertToken>",
+      );
+
+      sendKeys(editor, ["\x1b"]);
+      assert.equal(
+        editor.borderColor("border"),
+        "<normalToken>border</normalToken>",
+      );
+
+      sendKeys(editor, [":"]);
+      assert.equal(editor.borderColor("border"), "<exToken>border</exToken>");
+    } finally {
+      restore();
+    }
+  });
+
+  for (const [name, commandKeys] of [
+    ["i", ["i"]],
+    ["a", ["a"]],
+    ["A", ["A"]],
+    ["I", ["I"]],
+    ["o", ["o"]],
+    ["O", ["O"]],
+    ["C", ["C"]],
+    ["S", ["S"]],
+    ["s", ["s"]],
+    ["cc", ["c", "c"]],
+    ["cw", ["c", "w"]],
+    ["ct space", ["c", "t", " "]],
+  ] as const) {
+    it(`border updates for mode-changing commands: ${name}`, () => {
+      assertInsertBorderAfterModeChangingCommand("alpha beta", [
+        ...commandKeys,
+      ]);
+    });
+  }
+});
+
+describe("cursor shape lifecycle", () => {
+  it("registers cleanup on session_shutdown and not session_end", async () => {
+    const extension = await installExtensionWithEditorFactory();
+
+    assert.equal(extension.sessionShutdownHandlerCount, 1);
+    assert.equal(extension.sessionEndHandlerCount, 0);
+  });
+
+  it("enables hardware cursor and restores the captured setting on shutdown", async () => {
+    const extension = await installExtensionWithEditorFactory();
+    const tui = createCursorShapeTui({ initialShowHardwareCursor: false });
+    const operations: string[] = [];
+    const originalWrite = tui.terminal.write;
+    const originalSetShowHardwareCursor = tui.setShowHardwareCursor;
+
+    assert.ok(originalWrite, "expected terminal.write test stub");
+    assert.ok(
+      originalSetShowHardwareCursor,
+      "expected setShowHardwareCursor test stub",
+    );
+
+    tui.terminal.write = (data: string) => {
+      operations.push(`write:${data}`);
+      originalWrite(data);
+    };
+    tui.setShowHardwareCursor = (show: boolean) => {
+      operations.push(`set:${show}`);
+      originalSetShowHardwareCursor(show);
+    };
+
+    const editor = extension.editorFactory(tui, stubTheme, stubKeybindings);
+
+    assert.equal(editor instanceof ModalEditor, true);
+    assert.equal(tui.getShowHardwareCursorCalls, 1);
+    assert.deepEqual(tui.hardwareCursorValues, [true]);
+    assert.deepEqual(tui.terminalWrites, []);
+
+    await extension.emitShutdown();
+
+    assert.deepEqual(tui.terminalWrites, [RESET_CURSOR_SHAPE]);
+    assert.deepEqual(tui.hardwareCursorValues, [true, false]);
+    assert.deepEqual(operations, [
+      "set:true",
+      `write:${RESET_CURSOR_SHAPE}`,
+      "set:false",
+    ]);
+  });
+
+  it("resets shape without guessing a previous setting when no getter exists", async () => {
+    const extension = await installExtensionWithEditorFactory();
+    const tui = createCursorShapeTui({ getShowHardwareCursor: false });
+    const operations: string[] = [];
+    const originalWrite = tui.terminal.write;
+    const originalSetShowHardwareCursor = tui.setShowHardwareCursor;
+
+    assert.ok(originalWrite, "expected terminal.write test stub");
+    assert.ok(
+      originalSetShowHardwareCursor,
+      "expected setShowHardwareCursor test stub",
+    );
+
+    tui.terminal.write = (data: string) => {
+      operations.push(`write:${data}`);
+      originalWrite(data);
+    };
+    tui.setShowHardwareCursor = (show: boolean) => {
+      operations.push(`set:${show}`);
+      originalSetShowHardwareCursor(show);
+    };
+
+    extension.editorFactory(tui, stubTheme, stubKeybindings);
+
+    assert.equal(tui.getShowHardwareCursorCalls, 0);
+    assert.deepEqual(tui.hardwareCursorValues, [true]);
+
+    await extension.emitShutdown();
+
+    assert.deepEqual(tui.terminalWrites, [RESET_CURSOR_SHAPE]);
+    assert.deepEqual(tui.hardwareCursorValues, [true]);
+    assert.deepEqual(operations, ["set:true", `write:${RESET_CURSOR_SHAPE}`]);
+  });
+
+  it("skips startup enablement and cleanup cursor writes on unsupported runtimes", async () => {
+    const extension = await installExtensionWithEditorFactory();
+    const tui = createCursorShapeTui({ setShowHardwareCursor: false });
+
+    extension.editorFactory(tui, stubTheme, stubKeybindings);
+
+    assert.equal(tui.getShowHardwareCursorCalls, 0);
+    assert.deepEqual(tui.hardwareCursorValues, []);
+
+    await extension.emitShutdown();
+
+    assert.deepEqual(tui.terminalWrites, []);
+    assert.deepEqual(tui.hardwareCursorValues, []);
+  });
+});
+
+describe("cursor shape rendering", () => {
+  it("writes insert cursor shape and strips the EOL software cursor", () => {
+    const tui = createCursorShapeTui({ initialShowHardwareCursor: true });
+    const editor = new ModalEditor(tui, stubTheme, stubKeybindings);
+    focusEditor(editor);
+
+    const lines = editor.render(20);
+    const markerLine = findCursorMarkerLine(lines);
+
+    assert.deepEqual(tui.terminalWrites, [INSERT_CURSOR_SHAPE]);
+    assert.equal(tui.terminalWrites.includes(RESET_CURSOR_SHAPE), false);
+    assert.equal(markerLine.includes(CURSOR_MARKER), true);
+    assert.equal(markerLine.includes(SOFTWARE_CURSOR_SPACE), false);
+    assert.equal(visibleWidth(removeCursorMarker(markerLine)), 20);
+    assertNoCursorShapeSequences(lines);
+  });
+
+  it("preserves the character under the insert cursor", () => {
+    const tui = createCursorShapeTui({ initialShowHardwareCursor: true });
+    const editor = new ModalEditor(tui, stubTheme, stubKeybindings);
+    for (const char of "abc") {
+      editor.handleInput(char);
+    }
+    focusEditor(editor);
+    setInternalCursor(editor, 1);
+
+    const lines = editor.render(20);
+    const markerLine = findCursorMarkerLine(lines);
+    const plainLine = removeCursorMarker(markerLine);
+
+    assert.deepEqual(tui.terminalWrites, [INSERT_CURSOR_SHAPE]);
+    assert.equal(markerLine.includes("\x1b[7mb\x1b[0m"), false);
+    assert.equal(plainLine.startsWith("abc"), true);
+    assert.equal(visibleWidth(plainLine), 20);
+    assertNoCursorShapeSequences(lines);
+  });
+
+  it("writes normal block cursor shape and strips the software cursor", () => {
+    const tui = createCursorShapeTui({ initialShowHardwareCursor: true });
+    const editor = new ModalEditor(tui, stubTheme, stubKeybindings);
+    sendKeys(editor, ["a", "b", "\x1b"]);
+    focusEditor(editor);
+
+    const lines = editor.render(20);
+    const markerLine = findCursorMarkerLine(lines);
+
+    assert.deepEqual(tui.terminalWrites, [BLOCK_CURSOR_SHAPE]);
+    assert.equal(markerLine.includes(SOFTWARE_CURSOR_SPACE), false);
+    assertNoCursorShapeSequences(lines);
+  });
+
+  it("writes EX block cursor shape and preserves EX label rendering", () => {
+    const tui = createCursorShapeTui({ initialShowHardwareCursor: true });
+    const editor = new ModalEditor(tui, stubTheme, stubKeybindings);
+    sendKeys(editor, ["\x1b", ":"]);
+    focusEditor(editor);
+
+    const lines = editor.render(20);
+    const markerLine = findCursorMarkerLine(lines);
+    const footer = lines.at(-1) ?? "";
+
+    assert.deepEqual(tui.terminalWrites, [BLOCK_CURSOR_SHAPE]);
+    assert.ok(footer.includes(" EX :_ "));
+    assert.equal(markerLine.includes(SOFTWARE_CURSOR_SPACE), false);
+    assertNoCursorShapeSequences(lines);
+  });
+
+  it("caches repeated renders and writes only changed cursor shapes", () => {
+    const tui = createCursorShapeTui({ initialShowHardwareCursor: true });
+    const editor = new ModalEditor(tui, stubTheme, stubKeybindings);
+    focusEditor(editor);
+
+    editor.render(20);
+    editor.render(20);
+    editor.handleInput("\x1b");
+    editor.render(20);
+    editor.render(20);
+    editor.handleInput("i");
+    editor.render(20);
+
+    assert.deepEqual(tui.terminalWrites, [
+      INSERT_CURSOR_SHAPE,
+      BLOCK_CURSOR_SHAPE,
+      INSERT_CURSOR_SHAPE,
+    ]);
+  });
+
+  it("falls back to the software cursor when hardware cursor APIs are unsupported", () => {
+    const tui = createCursorShapeTui({ setShowHardwareCursor: false });
+    const editor = new ModalEditor(tui, stubTheme, stubKeybindings);
+    focusEditor(editor);
+
+    const lines = editor.render(20);
+    const markerLine = findCursorMarkerLine(lines);
+
+    assert.deepEqual(tui.terminalWrites, []);
+    assert.equal(markerLine.includes(SOFTWARE_CURSOR_SPACE), true);
+    assertNoCursorShapeSequences(lines);
+  });
+
+  it("preserves the software cursor while supported hardware cursor display is disabled", () => {
+    const tui = createCursorShapeTui({ initialShowHardwareCursor: false });
+    const editor = new ModalEditor(tui, stubTheme, stubKeybindings);
+    focusEditor(editor);
+
+    const disabledLines = editor.render(20);
+    const disabledMarkerLine = findCursorMarkerLine(disabledLines);
+
+    assert.deepEqual(tui.terminalWrites, []);
+    assert.equal(tui.getShowHardwareCursorCalls, 1);
+    assert.equal(disabledMarkerLine.includes(SOFTWARE_CURSOR_SPACE), true);
+    assertNoCursorShapeSequences(disabledLines);
+
+    tui.setShowHardwareCursor?.(true);
+    const enabledLines = editor.render(20);
+    const enabledMarkerLine = findCursorMarkerLine(enabledLines);
+
+    assert.deepEqual(tui.hardwareCursorValues, [true]);
+    assert.deepEqual(tui.terminalWrites, [INSERT_CURSOR_SHAPE]);
+    assert.equal(tui.getShowHardwareCursorCalls, 2);
+    assert.equal(enabledMarkerLine.includes(SOFTWARE_CURSOR_SPACE), false);
+    assertNoCursorShapeSequences(enabledLines);
+  });
+
+  it("keeps the software cursor when focused render has no cursor marker", () => {
+    const tui = createCursorShapeTui({ initialShowHardwareCursor: true });
+    const editor = new ModalEditor(tui, stubTheme, stubKeybindings);
+    const internal = editor as unknown as { autocompleteState?: string | null };
+    internal.autocompleteState = "regular";
+    focusEditor(editor);
+
+    const lines = editor.render(20);
+
+    assert.equal(
+      lines.some((line) => line.includes(CURSOR_MARKER)),
+      false,
+    );
+    assert.equal(
+      lines.some((line) => line.includes(SOFTWARE_CURSOR_SPACE)),
+      true,
+    );
+    assert.deepEqual(tui.terminalWrites, []);
+    assertNoCursorShapeSequences(lines);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Delete (d) operator — 6 motions
+// ---------------------------------------------------------------------------
+
+describe("delete operator — dw / de / db / d$ / d0 / dd", () => {
+  it("dw deletes forward word (exclusive), updates register", () => {
+    chk("hello world", ["d", "w"], "world", "hello ");
+  });
+
+  it("dw clipboard receives deleted text", () => {
+    const { editor, clipboardWrites } = createEditorWithSpy("foo bar");
+    sendKeys(editor, ["d", "w"]);
+    assert.deepEqual(clipboardWrites, ["foo "]);
+  });
+
+  it("dw swallows async clipboard failures", async () => {
+    const { editor } = createEditorWithSpy("foo bar");
+    const rejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => {
+      rejections.push(reason);
+    };
+
+    editor.setClipboardFn(async () => {
+      throw new Error("clipboard boom");
+    });
+
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      sendKeys(editor, ["d", "w"]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+
+    assert.equal(editor.getText(), "bar");
+    assert.equal(editor.getRegister(), "foo ");
+    assert.deepEqual(rejections, []);
+  });
+
+  it("clipboard helper treats Pi copyToClipboard throws as best-effort", async () => {
+    const helperSource = await getClipboardHelperSourceWithMock(
+      [
+        "export function copyToClipboard(text) {",
+        '  process.stdout.write("copy:" + text);',
+        '  throw new Error("clipboard backend failed");',
+        "}",
+      ].join("\n"),
+    );
+
+    const result = await runClipboardHelperSource(helperSource, "payload");
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.signal, null);
+    assert.equal(result.stdout, "copy:payload");
+  });
+
+  it("clipboard read helper treats no text as an empty successful read", async () => {
+    const helperSource = await getClipboardReadHelperSourceWithMock(
+      [
+        "{",
+        "  async hasText() { return false; },",
+        '  async getText() { throw new Error("No string found"); },',
+        "}",
+      ].join("\n"),
+    );
+
+    const result = await runClipboardHelperSource(helperSource, "");
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.signal, null);
+    assert.equal(result.stdout, "");
+  });
+
+  it("active clipboard write receives no abort event when superseded", async () => {
+    const { editor } = createEditorWithSpy("foo bar baz");
+    const activeWrite = deferred();
+    const events: string[] = [];
+
+    editor.setClipboardFn(async (text, signal) => {
+      events.push(`start:${text}`);
+      signal?.addEventListener(
+        "abort",
+        () => {
+          events.push(`abort:${text}`);
+        },
+        { once: true },
+      );
+
+      if (text === "foo ") {
+        await activeWrite.promise;
+      }
+
+      events.push(`end:${text}`);
+    });
+
+    sendKeys(editor, ["d", "w", "d", "w"]);
+
+    try {
+      await nextImmediate();
+
+      assert.deepEqual(events, ["start:foo "]);
+    } finally {
+      activeWrite.resolve();
+      await nextImmediate();
+    }
+  });
+
+  it("three rapid clipboard writes keep first active and final pending text", async () => {
+    const { editor } = createEditorWithSpy("foo bar baz qux");
+    const firstWrite = deferred();
+    const events: string[] = [];
+
+    editor.setClipboardFn(async (text, signal) => {
+      events.push(`start:${text}`);
+      signal?.addEventListener(
+        "abort",
+        () => {
+          events.push(`abort:${text}`);
+        },
+        { once: true },
+      );
+
+      if (text === "foo ") {
+        await firstWrite.promise;
+        if (signal?.aborted) {
+          throw signal.reason ?? new Error("clipboard aborted");
+        }
+      }
+
+      events.push(`end:${text}`);
+    });
+
+    sendKeys(editor, ["d", "w", "d", "w", "d", "w"]);
+    firstWrite.resolve();
+    await nextImmediate();
+
+    assert.equal(editor.getText(), "qux");
+    assert.equal(editor.getRegister(), "baz ");
+    assert.deepEqual(events, [
+      "start:foo ",
+      "end:foo ",
+      "start:baz ",
+      "end:baz ",
+    ]);
+  });
+
+  it("clipboard timeout abort still drains the latest pending text", async () => {
+    const { editor } = createEditorWithSpy("foo bar baz qux");
+    const finalWrite = deferred();
+    const events: string[] = [];
+
+    editor.setClipboardWriteTimeoutMs(5);
+    editor.setClipboardFn(
+      (text, signal) =>
+        new Promise<void>((resolve, reject) => {
+          events.push(`start:${text}`);
+          signal?.addEventListener(
+            "abort",
+            () => {
+              const reason =
+                signal.reason instanceof Error
+                  ? signal.reason.message
+                  : String(signal.reason);
+              events.push(`abort:${text}:${reason}`);
+              reject(signal.reason ?? new Error("clipboard aborted"));
+            },
+            { once: true },
+          );
+
+          if (text === "foo ") {
+            return;
+          }
+
+          events.push(`end:${text}`);
+          if (text === "baz ") {
+            finalWrite.resolve();
+          }
+          resolve();
+        }),
+    );
+
+    sendKeys(editor, ["d", "w", "d", "w", "d", "w"]);
+    await withTimeout(
+      finalWrite.promise,
+      100,
+      "timed out waiting for clipboard drain to write latest pending text",
+    );
+
+    assert.equal(editor.getText(), "qux");
+    assert.equal(editor.getRegister(), "baz ");
+    assert.deepEqual(events, [
+      "start:foo ",
+      "abort:foo :clipboard write timed out",
+      "start:baz ",
+      "end:baz ",
+    ]);
+  });
+
+  it("clipboard timeouts do not trip the spawn failure circuit breaker", async () => {
+    const { editor } = createEditorWithSpy("one two three four five");
+    const attempts: string[] = [];
+    const expectedRegisters = ["one ", "two ", "three ", "four "];
+    const aborts = new Map(expectedRegisters.map((text) => [text, deferred()]));
+
+    editor.setClipboardWriteTimeoutMs(0);
+    editor.setClipboardFn(
+      (text, signal) =>
+        new Promise<void>((_resolve, reject) => {
+          attempts.push(text);
+          const onAbort = () => {
+            aborts.get(text)?.resolve();
+            reject(createSpawnErrno("late spawn after timeout"));
+          };
+
+          if (signal?.aborted) {
+            onAbort();
+            return;
+          }
+
+          signal?.addEventListener("abort", onAbort, { once: true });
+        }),
+    );
+
+    for (const expectedRegister of expectedRegisters) {
+      sendKeys(editor, ["d", "w"]);
+      const abort = aborts.get(expectedRegister);
+      assert.ok(abort, `abort deferred for ${expectedRegister}`);
+      await withTimeout(
+        abort.promise,
+        100,
+        `timed out waiting for clipboard timeout abort for ${expectedRegister}`,
+      );
+      assert.equal(editor.getRegister(), expectedRegister);
+    }
+
+    assert.equal(editor.getText(), "five");
+    assert.deepEqual(attempts, expectedRegisters);
+  });
+
+  it("repeated spawn-classified clipboard failures stop mirroring while register writes continue", async () => {
+    const { editor } = createEditorWithSpy("one two three four five");
+    const attempts: string[] = [];
+
+    try {
+      editor.setClipboardFn(async (text) => {
+        attempts.push(text);
+        throw createSpawnErrno("spawn failed");
+      });
+
+      for (const expectedRegister of ["one ", "two ", "three "]) {
+        sendKeys(editor, ["d", "w"]);
+        await nextImmediate();
+        assert.equal(editor.getRegister(), expectedRegister);
+      }
+
+      assert.deepEqual(attempts, ["one ", "two ", "three "]);
+
+      sendKeys(editor, ["d", "w"]);
+      await nextImmediate();
+
+      assert.equal(editor.getText(), "five");
+      assert.equal(editor.getRegister(), "four ");
+      assert.deepEqual(attempts, ["one ", "two ", "three "]);
+    } finally {
+      editor.setClipboardFn(() => {});
+    }
+  });
+
+  it("spawn-classified clipboard failures stop mirroring across editor instances", async () => {
+    const first = createEditorWithSpy("one two three four five");
+    const second = createEditorWithSpy("alpha beta");
+    const attempts: string[] = [];
+    const failSpawn = async (text: string) => {
+      attempts.push(text);
+      throw createSpawnErrno("spawn failed");
+    };
+
+    try {
+      first.editor.setClipboardFn(failSpawn);
+      second.editor.setClipboardFn(failSpawn);
+
+      for (const expectedRegister of ["one ", "two ", "three "]) {
+        sendKeys(first.editor, ["d", "w"]);
+        await nextImmediate();
+        assert.equal(first.editor.getRegister(), expectedRegister);
+      }
+
+      assert.deepEqual(attempts, ["one ", "two ", "three "]);
+
+      sendKeys(second.editor, ["d", "w"]);
+      await nextImmediate();
+
+      assert.equal(second.editor.getText(), "beta");
+      assert.equal(second.editor.getRegister(), "alpha ");
+      assert.deepEqual(attempts, ["one ", "two ", "three "]);
+    } finally {
+      first.editor.setClipboardFn(() => {});
+    }
+  });
+
+  it("repeated generic clipboard failures do not trip the spawn failure circuit breaker", async () => {
+    const { editor } = createEditorWithSpy("one two three four five");
+    const attempts: string[] = [];
+
+    editor.setClipboardFn(async (text) => {
+      attempts.push(text);
+      throw new Error("clipboard backend failed");
+    });
+
+    for (const expectedRegister of ["one ", "two ", "three ", "four "]) {
+      sendKeys(editor, ["d", "w"]);
+      await nextImmediate();
+      assert.equal(editor.getRegister(), expectedRegister);
+    }
+
+    assert.equal(editor.getText(), "five");
+    assert.deepEqual(attempts, ["one ", "two ", "three ", "four "]);
+  });
+
+  it("de deletes to end of word (inclusive), updates register", () => {
+    // "hello world" col 0: e→col 4 inclusive → delete "hello", leave " world"
+    chk("hello world", ["d", "e"], " world", "hello");
+  });
+
+  it("de inclusive equal-column: single-char word", () => {
+    // "a" col 0: e→col 0 inclusive → delete "a", leave ""
+    chk("a", ["d", "e"], "", "a");
+  });
+
+  it("de inclusive equal-column: last char of multi-char word", () => {
+    // "abc" col 2 (press l l): e→col 2 inclusive → delete "c", leave "ab"
+    chk("abc", ["l", "l", "d", "e"], "ab", "c");
+  });
+
+  it("db deletes backward word (exclusive)", () => {
+    // navigate w to col 4 ('b' of "bar"), then db → delete "foo "
+    chk("foo bar", ["w", "d", "b"], "bar", "foo ");
+  });
+
+  it("d$ deletes to end of line (exclusive of EOL)", () => {
+    chk("hello world", ["d", "$"], "", "hello world");
+  });
+
+  it("d0 deletes back to start of line (exclusive of col 0)", () => {
+    // navigate w to col 4, then d0 → delete "foo " (cols 0–3)
+    chk("foo bar", ["w", "d", "0"], "bar", "foo ");
+  });
+
+  it("dd deletes linewise and writes newline-terminated register", () => {
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["d", "d"]);
+    assert.equal(editor.getRegister(), "hello\n");
+    assert.equal(editor.getText(), "");
+  });
+});
+
+describe("delete operator — WORD motions (dW / dE / dB)", () => {
+  it("dW deletes to next WORD start", () => {
+    chk("foo-bar   baz", ["d", "W"], "baz", "foo-bar   ");
+  });
+
+  it("dE deletes to end of current WORD (inclusive)", () => {
+    chk("foo-bar   baz", ["d", "E"], "   baz", "foo-bar");
+  });
+
+  it("dB deletes backward by WORD", () => {
+    chk("foo-bar baz", ["W", "d", "B"], "baz", "foo-bar ");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Linewise operators, counts, and whole-buffer flows
+// ---------------------------------------------------------------------------
+
+describe("linewise operators and counts", () => {
+  it("d2j deletes current line plus two below", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc\nd");
+
+    sendKeys(editor, ["d", "2", "j"]);
+
+    assert.equal(editor.getText(), "d");
+    assert.equal(editor.getRegister(), "a\nb\nc\n");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+  });
+
+  it("y2j yanks current line plus two below without mutation", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc\nd");
+    const before = editor.getText();
+
+    sendKeys(editor, ["y", "2", "j"]);
+
+    assert.equal(editor.getText(), before);
+    assert.equal(editor.getRegister(), "a\nb\nc\n");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+  });
+
+  it("3dd deletes three lines", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc\nd");
+
+    sendKeys(editor, ["3", "d", "d"]);
+
+    assert.equal(editor.getText(), "d");
+    assert.equal(editor.getRegister(), "a\nb\nc\n");
+  });
+
+  it("2yy yanks two lines", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc\nd");
+    const before = editor.getText();
+
+    sendKeys(editor, ["j", "2", "y", "y"]);
+
+    assert.equal(editor.getText(), before);
+    assert.equal(editor.getRegister(), "b\nc\n");
+  });
+
+  it("d999j clamps deletion at EOF", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc");
+
+    sendKeys(editor, ["d", "9", "9", "9", "j"]);
+
+    assert.equal(editor.getText(), "");
+    assert.equal(editor.getRegister(), "a\nb\nc\n");
+  });
+
+  it("y999k clamps yank at BOF", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc");
+    const before = editor.getText();
+
+    sendKeys(editor, ["G", "y", "9", "9", "9", "k"]);
+
+    assert.equal(editor.getText(), before);
+    assert.equal(editor.getRegister(), "a\nb\nc\n");
+  });
+
+  it("ggdG deletes the whole buffer", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc");
+
+    sendKeys(editor, ["g", "g", "d", "G"]);
+
+    assert.equal(editor.getText(), "");
+    assert.equal(editor.getRegister(), "a\nb\nc\n");
+  });
+
+  it("ggyG yanks the whole buffer without mutation", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc");
+    const before = editor.getText();
+
+    sendKeys(editor, ["g", "g", "y", "G"]);
+
+    assert.equal(editor.getText(), before);
+    assert.equal(editor.getRegister(), "a\nb\nc\n");
+  });
+
+  it("dG from middle line deletes to EOF linewise", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc\nd");
+
+    sendKeys(editor, ["j", "d", "G"]);
+
+    assert.equal(editor.getText(), "a");
+    assert.equal(editor.getRegister(), "b\nc\nd\n");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+  });
+
+  it("invalid continuation after counted delete cancels cleanly", () => {
+    const { editor } = createMultiLineEditor("foo bar\nbaz");
+
+    sendKeys(editor, ["d", "2", "z", "w", "x"]);
+
+    assert.equal(editor.getText(), "foo ar\nbaz");
+    assert.equal(editor.getRegister(), "b");
+  });
+
+  it("counted delete motion d2w deletes two words", () => {
+    const { editor } = createEditorWithSpy("foo bar baz");
+
+    sendKeys(editor, ["d", "2", "w"]);
+
+    assert.equal(editor.getText(), "baz");
+    assert.equal(editor.getRegister(), "foo bar ");
+  });
+
+  it("counted delete motion d2W deletes two WORDs", () => {
+    const { editor } = createEditorWithSpy("foo-bar   baz qux");
+
+    sendKeys(editor, ["d", "2", "W"]);
+
+    assert.equal(editor.getText(), "qux");
+    assert.equal(editor.getRegister(), "foo-bar   baz ");
+  });
+
+  it("counted prefix 2dW deletes two WORDs", () => {
+    const { editor } = createEditorWithSpy("foo-bar   baz qux");
+
+    sendKeys(editor, ["2", "d", "W"]);
+
+    assert.equal(editor.getText(), "qux");
+    assert.equal(editor.getRegister(), "foo-bar   baz ");
+  });
+
+  it("counted change motion c2E works for WORD semantics", () => {
+    const { editor } = createEditorWithSpy("foo-bar   baz qux");
+
+    sendKeys(editor, ["c", "2", "E"]);
+
+    assert.equal(editor.getText(), " qux");
+    assert.equal(editor.getRegister(), "foo-bar   baz");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("counted change motion c2B works for WORD semantics", () => {
+    const { editor } = createEditorWithSpy("one two three");
+
+    sendKeys(editor, ["W", "W", "c", "2", "B"]);
+
+    assert.equal(editor.getText(), "three");
+    assert.equal(editor.getRegister(), "one two ");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("counted prefix 2cB changes backward across two WORDs", () => {
+    const { editor } = createEditorWithSpy("one two three");
+
+    sendKeys(editor, ["W", "W", "2", "c", "B"]);
+
+    assert.equal(editor.getText(), "three");
+    assert.equal(editor.getRegister(), "one two ");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("counted unsupported yank motion y2w cancels instead of yanking", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+
+    sendKeys(editor, ["y", "2", "w"]);
+
+    assert.equal(editor.getText(), "foo bar");
+    assert.equal(editor.getRegister(), "");
+  });
+
+  it("counted unsupported yank motion y2W cancels instead of yanking", () => {
+    const { editor } = createEditorWithSpy("foo-bar baz");
+
+    sendKeys(editor, ["y", "2", "W"]);
+
+    assert.equal(editor.getText(), "foo-bar baz");
+    assert.equal(editor.getRegister(), "");
+  });
+
+  it("counted unsupported yank motion y2E cancels and does not stay sticky", () => {
+    const { editor } = createEditorWithSpy("foo-bar baz");
+
+    sendKeys(editor, ["y", "2", "E", "x"]);
+
+    assert.equal(editor.getText(), "oo-bar baz");
+    assert.equal(editor.getRegister(), "f");
+  });
+
+  it("counted yank text objects cancel without mutation or register writes", () => {
+    const scenarios = [
+      { name: "y2aw", keys: ["y", "2", "a", "w"] },
+      { name: "2yaw", keys: ["2", "y", "a", "w"] },
+      { name: "y2aW", keys: ["y", "2", "a", "W"] },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createEditorWithSpy("foo bar");
+      const beforeCursor = editor.getCursor();
+      editor.setRegister("seed");
+
+      sendKeys(editor, scenario.keys);
+
+      assert.equal(editor.getText(), "foo bar", `${scenario.name} text`);
+      assert.equal(editor.getRegister(), "seed", `${scenario.name} register`);
+      assert.deepEqual(
+        editor.getCursor(),
+        beforeCursor,
+        `${scenario.name} cursor`,
+      );
+    }
+  });
+
+  it("normal keys work after counted yank text-object cancellation", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+
+    sendKeys(editor, ["y", "2", "a", "w", "x"]);
+
+    assert.equal(editor.getText(), "oo bar");
+    assert.equal(editor.getRegister(), "f");
+  });
+
+  it("2d0 does not swallow 0 as a second count", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+
+    sendKeys(editor, ["2", "d", "0", "x"]);
+
+    assert.equal(editor.getText(), "oo bar");
+    assert.equal(editor.getRegister(), "f");
+  });
+});
+
+describe("Universal Counts State & Bounds", () => {
+  it("2d3j multiplies prefix and operator counts", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc\nd\ne\nf\ng\nh");
+
+    sendKeys(editor, ["2", "d", "3", "j"]);
+
+    assert.equal(editor.getText(), "g\nh");
+  });
+
+  it("99999x is bounded and deletes only available text", () => {
+    const { editor } = createEditorWithSpy("abc");
+
+    sendKeys(editor, ["9", "9", "9", "9", "9", "x"]);
+
+    assert.equal(editor.getText(), "");
+  });
+
+  it("2d3<Esc>x clears pending count/operator state", () => {
+    const { editor } = createEditorWithSpy("abc");
+
+    sendKeys(editor, ["2", "d", "3", "\x1b", "x"]);
+
+    assert.equal(editor.getText(), "bc");
+  });
+
+  it("bracketed paste in normal mode clears state and keeps x working", () => {
+    const { editor } = createEditorWithSpy("abc");
+
+    sendKeys(editor, ["2", "d", "\x1b[200~paste\x1b[201~", "x"]);
+
+    assert.equal(editor.getText(), "bc");
+  });
+});
+
+describe("buffer motions — gg / G", () => {
+  it("gg from the last line reaches line 0", () => {
+    const editor = createEditorAtBufferEnd("alpha\nbeta\ngamma");
+
+    sendKeys(editor, ["g", "g"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+  });
+
+  it("G from the first line reaches the last line", () => {
+    const { editor } = createMultiLineEditor("alpha\nbeta\ngamma");
+
+    sendKeys(editor, ["G"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 2, col: 0 });
+  });
+
+  it("G moves to last line at column 0", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+
+    sendKeys(editor, ["G", "x"]);
+
+    assert.equal(editor.getText(), "foo\nar");
+    assert.equal(editor.getRegister(), "b");
+  });
+
+  it("gg moves to first line at column 0", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+
+    sendKeys(editor, ["G", "g", "g", "x"]);
+
+    assert.equal(editor.getText(), "oo\nbar");
+    assert.equal(editor.getRegister(), "f");
+  });
+
+  it("gg reaches line 0 across wrapped logical lines", () => {
+    const wrappedLine = "x".repeat(200);
+    const editor = createEditorAtBufferEnd(`top\n${wrappedLine}\nbottom`);
+
+    sendKeys(editor, ["g", "g"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+  });
+
+  it("{count}gg moves to target line (1-indexed)", () => {
+    const { editor } = createMultiLineEditor("aa\nbb\ncc\ndd");
+
+    sendKeys(editor, ["G", "2", "g", "g", "x"]);
+
+    assert.equal(editor.getText(), "aa\nb\ncc\ndd");
+    assert.equal(editor.getRegister(), "b");
+  });
+
+  it("3gg moves to line 2 (0-indexed)", () => {
+    const editor = createEditorAtBufferEnd("aa\nbb\ncc\ndd");
+
+    sendKeys(editor, ["3", "g", "g"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 2, col: 0 });
+  });
+
+  it("{count}G moves to target line (1-indexed)", () => {
+    const { editor } = createMultiLineEditor("aa\nbb\ncc\ndd");
+
+    sendKeys(editor, ["3", "G", "x"]);
+
+    assert.equal(editor.getText(), "aa\nbb\nc\ndd");
+    assert.equal(editor.getRegister(), "c");
+  });
+});
+
+describe("first non-whitespace motion — ^", () => {
+  it("^ moves to the first non-whitespace character", () => {
+    const { editor } = createEditorWithSpy("    foo");
+
+    sendKeys(editor, ["$", "^", "x"]);
+
+    assert.equal(editor.getText(), "    oo");
+    assert.equal(editor.getRegister(), "f");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 4 });
+  });
+
+  it("prefixed ^ clears count state before later commands", () => {
+    const { editor } = createEditorWithSpy("    foo bar");
+
+    sendKeys(editor, ["3", "^", "x"]);
+
+    assert.equal(editor.getText(), "    oo bar");
+    assert.equal(editor.getRegister(), "f");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 4 });
+  });
+
+  it("d^ deletes back to the first non-whitespace character", () => {
+    chk("    foo bar", ["w", "w", "d", "^"], "    bar", "foo ");
+  });
+
+  it("c^ changes back to the first non-whitespace character", () => {
+    const { editor } = createEditorWithSpy("    foo bar");
+
+    sendKeys(editor, ["w", "w", "c", "^"]);
+
+    assert.equal(editor.getText(), "    bar");
+    assert.equal(editor.getRegister(), "foo ");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("y^ yanks back to the first non-whitespace character", () => {
+    const { editor } = createEditorWithSpy("    foo bar");
+    const before = editor.getText();
+
+    sendKeys(editor, ["w", "w", "y", "^"]);
+
+    assert.equal(editor.getText(), before);
+    assert.equal(editor.getRegister(), "foo ");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 8 });
+  });
+});
+
+describe("paragraph motions — { / }", () => {
+  const paragraphFixture =
+    "alpha one\nalpha two\n\n   \nbeta one\nbeta two\n\ngamma one\n\n   ";
+
+  it("} moves to next paragraph start at column 0", () => {
+    const { editor } = createMultiLineEditor(paragraphFixture);
+
+    sendKeys(editor, ["}"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 4, col: 0 });
+  });
+
+  it("{ moves to previous paragraph start at column 0", () => {
+    const { editor } = createMultiLineEditor(paragraphFixture);
+
+    sendKeys(editor, ["}", "{"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+  });
+
+  it("paragraph motions from blank-line runs jump to surrounding paragraph starts", () => {
+    const { editor } = createMultiLineEditor(paragraphFixture);
+
+    sendKeys(editor, ["j", "j", "}"]);
+    assert.deepEqual(editor.getCursor(), { line: 4, col: 0 });
+
+    sendKeys(editor, ["j", "j", "{"]);
+    assert.deepEqual(editor.getCursor(), { line: 4, col: 0 });
+  });
+
+  it("supports counted paragraph motions 2} and 2{", () => {
+    const { editor } = createMultiLineEditor(paragraphFixture);
+
+    sendKeys(editor, ["2", "}"]);
+    assert.deepEqual(editor.getCursor(), { line: 7, col: 0 });
+
+    sendKeys(editor, ["2", "{"]);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+  });
+
+  it("paragraph motions clamp at BOF/EOF", () => {
+    const { editor } = createMultiLineEditor(paragraphFixture);
+
+    sendKeys(editor, ["{"]);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+
+    sendKeys(editor, ["G", "}"]);
+    assert.deepEqual(editor.getCursor(), { line: 9, col: 0 });
+  });
+
+  it("paragraph motions keep register/clipboard unchanged", () => {
+    const { editor, clipboardWrites } = createMultiLineEditor(paragraphFixture);
+    const before = editor.getText();
+    editor.setRegister("untouched");
+
+    sendKeys(editor, ["}", "{", "2", "}", "2", "{"]);
+
+    assert.equal(editor.getText(), before);
+    assert.equal(editor.getRegister(), "untouched");
+    assert.deepEqual(clipboardWrites, []);
+  });
+
+  it("paragraph integration keeps representative w/b/e behavior", () => {
+    const { editor } = createEditorWithSpy("foo bar baz");
+
+    sendKeys(editor, ["w"]);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 4 });
+
+    sendKeys(editor, ["e"]);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 6 });
+
+    sendKeys(editor, ["b"]);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 4 });
+  });
+});
+
+describe("matching pair motion", () => {
+  it("% on opening delimiter jumps to closing partner", () => {
+    const { editor } = createEditorWithSpy("foo(bar)");
+
+    sendKeys(editor, ["w", "%"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 7 });
+  });
+
+  it("% on closing delimiter jumps to opening partner", () => {
+    const { editor } = createEditorWithSpy("foo(bar)");
+    setInternalCursor(editor, 7);
+
+    sendKeys(editor, ["%"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 3 });
+  });
+
+  it("% before a delimiter scans forward and jumps to the partner", () => {
+    const { editor } = createEditorWithSpy("foo (bar)");
+
+    sendKeys(editor, ["%"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 8 });
+  });
+
+  it("% with no source delimiter on the current line no-ops", () => {
+    const { editor } = createMultiLineEditor("foo bar\n(baz)");
+
+    sendKeys(editor, ["%"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+  });
+
+  it("% with an unmatched source delimiter no-ops", () => {
+    const { editor } = createEditorWithSpy("foo(bar");
+    setInternalCursor(editor, 3);
+
+    sendKeys(editor, ["%"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 3 });
+  });
+
+  it("% at visible EOL after a closing delimiter jumps to opening partner", () => {
+    const { editor } = createEditorWithSpy("foo(bar)");
+    setInternalCursor(editor, 8);
+
+    sendKeys(editor, ["%"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 3 });
+  });
+
+  it("{count}% consumes count without affecting the next key", () => {
+    const { editor } = createEditorWithSpy("abcdef");
+
+    sendKeys(editor, ["3", "%", "x"]);
+
+    assert.equal(editor.getText(), "bcdef");
+    assert.equal(editor.getRegister(), "a");
+  });
+
+  it("no-op % preserves buffer text and unnamed register", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+    editor.setRegister("seed");
+
+    sendKeys(editor, ["%"]);
+
+    assert.equal(editor.getText(), "foo bar");
+    assert.equal(editor.getRegister(), "seed");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+  });
+
+  it("matching pair operator motion d% deletes forward inclusive range", () => {
+    const { editor, clipboardWrites } = createEditorWithSpy("foo(bar)baz");
+    setInternalCursor(editor, 3);
+
+    sendKeys(editor, ["d", "%"]);
+
+    assert.equal(editor.getText(), "foobaz");
+    assert.equal(editor.getRegister(), "(bar)");
+    assert.deepEqual(clipboardWrites, ["(bar)"]);
+  });
+
+  it("matching pair operator motion d% deletes backward inclusive range", () => {
+    const { editor, clipboardWrites } = createEditorWithSpy("foo(bar)baz");
+    setInternalCursor(editor, 7);
+
+    sendKeys(editor, ["d", "%"]);
+
+    assert.equal(editor.getText(), "foobaz");
+    assert.equal(editor.getRegister(), "(bar)");
+    assert.deepEqual(clipboardWrites, ["(bar)"]);
+  });
+
+  it("matching pair operator motion d% scan-forward anchors at original cursor", () => {
+    const { editor, clipboardWrites } = createEditorWithSpy("xx foo(bar) zz");
+    setInternalCursor(editor, 3);
+
+    sendKeys(editor, ["d", "%"]);
+
+    assert.equal(editor.getText(), "xx  zz");
+    assert.equal(editor.getRegister(), "foo(bar)");
+    assert.deepEqual(clipboardWrites, ["foo(bar)"]);
+  });
+
+  it("matching pair operator motion y% yanks forward without mutation", () => {
+    const { editor, clipboardWrites } = createEditorWithSpy("foo(bar)baz");
+    setInternalCursor(editor, 3);
+
+    sendKeys(editor, ["y", "%"]);
+
+    assert.equal(editor.getText(), "foo(bar)baz");
+    assert.equal(editor.getRegister(), "(bar)");
+    assert.deepEqual(clipboardWrites, ["(bar)"]);
+  });
+
+  it("matching pair operator motion y% yanks backward without mutation", () => {
+    const { editor, clipboardWrites } = createEditorWithSpy("foo(bar)baz");
+    setInternalCursor(editor, 7);
+
+    sendKeys(editor, ["y", "%"]);
+
+    assert.equal(editor.getText(), "foo(bar)baz");
+    assert.equal(editor.getRegister(), "(bar)");
+    assert.deepEqual(clipboardWrites, ["(bar)"]);
+  });
+
+  it("matching pair operator motion c% deletes range and enters insert mode", () => {
+    const { editor, clipboardWrites } = createEditorWithSpy("foo(bar)baz");
+    setInternalCursor(editor, 3);
+
+    sendKeys(editor, ["c", "%"]);
+
+    assert.equal(editor.getText(), "foobaz");
+    assert.equal(editor.getRegister(), "(bar)");
+    assert.equal(editor.getMode(), "insert");
+    assert.deepEqual(clipboardWrites, ["(bar)"]);
+  });
+
+  it("matching pair operator motion follows clipboard mirror yank policy", () => {
+    const deletion = createEditorWithSpy("foo(bar)baz");
+    deletion.editor.setClipboardMirrorPolicy("yank");
+    setInternalCursor(deletion.editor, 3);
+
+    sendKeys(deletion.editor, ["d", "%"]);
+
+    assert.equal(deletion.editor.getRegister(), "(bar)");
+    assert.deepEqual(deletion.clipboardWrites, []);
+
+    const yank = createEditorWithSpy("foo(bar)baz");
+    yank.editor.setClipboardMirrorPolicy("yank");
+    setInternalCursor(yank.editor, 3);
+
+    sendKeys(yank.editor, ["y", "%"]);
+
+    assert.equal(yank.editor.getRegister(), "(bar)");
+    assert.deepEqual(yank.clipboardWrites, ["(bar)"]);
+
+    const change = createEditorWithSpy("foo(bar)baz");
+    change.editor.setClipboardMirrorPolicy("yank");
+    setInternalCursor(change.editor, 3);
+
+    sendKeys(change.editor, ["c", "%"]);
+
+    assert.equal(change.editor.getRegister(), "(bar)");
+    assert.deepEqual(change.clipboardWrites, []);
+  });
+
+  it("matching pair operator motion no-target cancellation preserves text and register", () => {
+    for (const operator of ["d", "y", "c"] as const) {
+      const { editor, clipboardWrites } = createEditorWithSpy("foo(bar");
+      editor.setRegister("seed");
+      setInternalCursor(editor, 3);
+
+      sendKeys(editor, [operator, "%"]);
+
+      assert.equal(editor.getText(), "foo(bar");
+      assert.equal(editor.getRegister(), "seed");
+      assert.equal(editor.getMode(), "normal");
+      assert.deepEqual(clipboardWrites, []);
+
+      sendKeys(editor, ["x"]);
+
+      assert.equal(editor.getText(), "foobar");
+      assert.equal(editor.getRegister(), "(");
+      assert.deepEqual(clipboardWrites, ["("]);
+    }
+  });
+
+  it("matching pair operator motion counted forms cancel and clear stale state", () => {
+    const cases = [
+      ["d", "2", "%"],
+      ["2", "d", "%"],
+      ["y", "2", "%"],
+      ["2", "y", "%"],
+      ["c", "2", "%"],
+      ["2", "c", "%"],
+    ];
+
+    for (const keys of cases) {
+      const { editor, clipboardWrites } = createEditorWithSpy("foo(bar)");
+      editor.setRegister("seed");
+
+      sendKeys(editor, keys);
+
+      assert.equal(editor.getText(), "foo(bar)");
+      assert.equal(editor.getRegister(), "seed");
+      assert.equal(editor.getMode(), "normal");
+      assert.deepEqual(clipboardWrites, []);
+
+      sendKeys(editor, ["x"]);
+
+      assert.equal(editor.getText(), "oo(bar)");
+      assert.equal(editor.getRegister(), "f");
+      assert.deepEqual(clipboardWrites, ["f"]);
+    }
+  });
+
+  it("matching pair operator motion d% at visible EOL avoids the following newline", () => {
+    const { editor, clipboardWrites } = createMultiLineEditor("foo(bar)\nnext");
+    setInternalCursor(editor, 8);
+
+    sendKeys(editor, ["d", "%"]);
+
+    assert.equal(editor.getText(), "foo\nnext");
+    assert.equal(editor.getRegister(), "(bar)");
+    assert.deepEqual(clipboardWrites, ["(bar)"]);
+  });
+});
+
+describe("J — join lines", () => {
+  it("J joins current line with next, inserts separator space", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+
+    sendKeys(editor, ["J"]);
+
+    assert.equal(editor.getText(), "foo bar");
+  });
+
+  it("J on last line is a no-op", () => {
+    const { editor } = createEditorWithSpy("only line");
+
+    sendKeys(editor, ["J"]);
+
+    assert.equal(editor.getText(), "only line");
+  });
+
+  it("J preserves left trailing whitespace, no double space", () => {
+    const { editor } = createMultiLineEditor("foo  \nbar");
+
+    sendKeys(editor, ["J"]);
+
+    assert.equal(editor.getText(), "foo  bar");
+  });
+
+  it("J trims right leading whitespace", () => {
+    const { editor } = createMultiLineEditor("foo\n  bar");
+
+    sendKeys(editor, ["J"]);
+
+    assert.equal(editor.getText(), "foo bar");
+  });
+
+  it("J with empty right line: no trailing space", () => {
+    const { editor } = createMultiLineEditor("foo\n");
+
+    sendKeys(editor, ["J"]);
+
+    assert.equal(editor.getText(), "foo");
+  });
+
+  it("J cursor lands at join point (space position)", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+
+    sendKeys(editor, ["J"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 3 });
+  });
+
+  it("J cursor at join point when left has trailing space (no separator inserted)", () => {
+    const { editor } = createMultiLineEditor("foo \nbar");
+
+    sendKeys(editor, ["J"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 4 });
+  });
+
+  it("J does not write unnamed register", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+    editor.setRegister("untouched");
+
+    sendKeys(editor, ["J"]);
+
+    assert.equal(editor.getRegister(), "untouched");
+  });
+
+  it("J does not write clipboard", () => {
+    const { editor, clipboardWrites } = createMultiLineEditor("foo\nbar");
+
+    sendKeys(editor, ["J"]);
+
+    assert.deepEqual(clipboardWrites, []);
+  });
+
+  it("J keeps the cursor at the join point after a non-ascii grapheme", () => {
+    const { editor } = createMultiLineEditor("中\nx");
+
+    sendKeys(editor, ["J"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 1 });
+  });
+});
+
+describe("gJ — raw join lines", () => {
+  it("gJ joins without whitespace normalization", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+
+    sendKeys(editor, ["g", "J"]);
+
+    assert.equal(editor.getText(), "foobar");
+  });
+
+  it("gJ preserves right leading whitespace", () => {
+    const { editor } = createMultiLineEditor("foo\n  bar");
+
+    sendKeys(editor, ["g", "J"]);
+
+    assert.equal(editor.getText(), "foo  bar");
+  });
+
+  it("gJ on last line is a no-op", () => {
+    const { editor } = createEditorWithSpy("only line");
+
+    sendKeys(editor, ["g", "J"]);
+
+    assert.equal(editor.getText(), "only line");
+  });
+
+  it("gJ cursor lands at former newline boundary", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+
+    sendKeys(editor, ["g", "J"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 3 });
+  });
+
+  it("gJ does not write unnamed register", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+    editor.setRegister("untouched");
+
+    sendKeys(editor, ["g", "J"]);
+
+    assert.equal(editor.getRegister(), "untouched");
+  });
+});
+
+describe("counted J/gJ", () => {
+  it("3J joins three lines (2 steps)", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc\nd");
+
+    sendKeys(editor, ["3", "J"]);
+
+    assert.equal(editor.getText(), "a b c\nd");
+  });
+
+  it("3gJ joins three lines without normalization", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc\nd");
+
+    sendKeys(editor, ["3", "g", "J"]);
+
+    assert.equal(editor.getText(), "abc\nd");
+  });
+
+  it("count exceeding EOF clamps to available lines", () => {
+    const { editor } = createMultiLineEditor("a\nb");
+
+    sendKeys(editor, ["9", "J"]);
+
+    assert.equal(editor.getText(), "a b");
+  });
+
+  it("1J is a no-op (0 steps per spec formula)", () => {
+    const { editor } = createMultiLineEditor("a\nb");
+
+    sendKeys(editor, ["1", "J"]);
+
+    assert.equal(editor.getText(), "a\nb");
+  });
+
+  it("3J cursor at LAST join point", () => {
+    const { editor } = createMultiLineEditor("aa\nbb\ncc");
+
+    sendKeys(editor, ["3", "J"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 5 });
+  });
+
+  it("{count}gJ works: 2gJ joins two lines", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc");
+
+    sendKeys(editor, ["2", "g", "J"]);
+
+    assert.equal(editor.getText(), "ab\nc");
+  });
+});
+
+describe("gJ parse safety", () => {
+  it("g{count}J is a no-op (fail-closed)", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc");
+
+    sendKeys(editor, ["g", "3", "J"]);
+
+    assert.equal(editor.getText(), "a\nb\nc");
+  });
+
+  it("g{count}J does not write register", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc");
+    editor.setRegister("untouched");
+
+    sendKeys(editor, ["g", "3", "J"]);
+
+    assert.equal(editor.getRegister(), "untouched");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Change (c) operator — 6 motions, always enters insert mode
+// ---------------------------------------------------------------------------
+
+describe("change operator — cw / ce / cb / c$ / c0 / cc", () => {
+  it("cw: text mutated, register written, insert mode", () => {
+    const { editor } = createEditorWithSpy("hello world");
+    sendKeys(editor, ["c", "w"]);
+    assert.equal(editor.getRegister(), "hello ");
+    assert.equal(editor.getText(), "world");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("ce: inclusive delete, insert mode", () => {
+    const { editor } = createEditorWithSpy("hello world");
+    sendKeys(editor, ["c", "e"]);
+    assert.equal(editor.getRegister(), "hello");
+    assert.equal(editor.getText(), " world");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("cb from mid-word: backward delete, insert mode", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+    sendKeys(editor, ["w", "c", "b"]); // navigate to "bar", cb
+    assert.equal(editor.getRegister(), "foo ");
+    assert.equal(editor.getText(), "bar");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("c$: deletes to EOL, insert mode", () => {
+    chkMode("hello world", ["c", "$"], "insert");
+    chk("hello world", ["c", "$"], "", "hello world");
+  });
+
+  it("c0 from mid-line: deletes back to start, insert mode", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+    sendKeys(editor, ["w", "c", "0"]);
+    assert.equal(editor.getRegister(), "foo ");
+    assert.equal(editor.getText(), "bar");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("cc: clears line, insert mode", () => {
+    const { editor } = createEditorWithSpy("hello world");
+    sendKeys(editor, ["c", "c"]);
+    assert.equal(editor.getRegister(), "hello world");
+    assert.equal(editor.getText(), "");
+    assert.equal(editor.getMode(), "insert");
+  });
+});
+
+describe("change operator — WORD motions (cW / cE / cB)", () => {
+  it("cW on non-whitespace matches cE (Vim parity)", () => {
+    const { editor } = createEditorWithSpy("foo   bar");
+
+    sendKeys(editor, ["c", "W"]);
+
+    assert.equal(editor.getText(), "   bar");
+    assert.equal(editor.getRegister(), "foo");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("cW from whitespace deletes only whitespace run", () => {
+    const { editor } = createEditorWithSpy("foo   bar");
+
+    sendKeys(editor, ["l", "l", "l", "c", "W"]);
+
+    assert.equal(editor.getText(), "foobar");
+    assert.equal(editor.getRegister(), "   ");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("cE deletes to end of WORD inclusively", () => {
+    const { editor } = createEditorWithSpy("foo-bar   baz");
+
+    sendKeys(editor, ["c", "E"]);
+
+    assert.equal(editor.getText(), "   baz");
+    assert.equal(editor.getRegister(), "foo-bar");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("cB deletes backward by WORD", () => {
+    const { editor } = createEditorWithSpy("foo-bar baz");
+
+    sendKeys(editor, ["W", "c", "B"]);
+
+    assert.equal(editor.getText(), "baz");
+    assert.equal(editor.getRegister(), "foo-bar ");
+    assert.equal(editor.getMode(), "insert");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Word text objects — iw / aw with d/c/y
+// ---------------------------------------------------------------------------
+
+describe("word text objects — iw / aw", () => {
+  it("ciw deletes inner word and enters insert mode", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+    sendKeys(editor, ["c", "i", "w"]);
+    assert.equal(editor.getRegister(), "foo");
+    assert.equal(editor.getText(), " bar");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("caw deletes word plus trailing space and enters insert mode", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+    sendKeys(editor, ["c", "a", "w"]);
+    assert.equal(editor.getRegister(), "foo ");
+    assert.equal(editor.getText(), "bar");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("diw deletes inner word", () => {
+    chk("foo bar", ["d", "i", "w"], " bar", "foo");
+  });
+
+  it("d2iw deletes two inner words", () => {
+    chk("foo bar baz", ["d", "2", "i", "w"], " baz", "foo bar");
+  });
+
+  it("daw deletes word + trailing spaces", () => {
+    chk("foo bar", ["d", "a", "w"], "bar", "foo ");
+  });
+
+  it("daw from the final word includes leading whitespace", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+
+    setInternalCursor(editor, 4);
+    sendKeys(editor, ["d", "a", "w"]);
+
+    assert.equal(editor.getText(), "foo");
+    assert.equal(editor.getRegister(), " bar");
+  });
+
+  it("diw from whitespace chooses the next word", () => {
+    const { editor } = createEditorWithSpy("foo   bar");
+
+    setInternalCursor(editor, 3);
+    sendKeys(editor, ["d", "i", "w"]);
+
+    assert.equal(editor.getText(), "foo   ");
+    assert.equal(editor.getRegister(), "bar");
+  });
+
+  it("yiw yanks inner word without mutation", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+    const before = editor.getText();
+    sendKeys(editor, ["y", "i", "w"]);
+    assert.equal(editor.getRegister(), "foo");
+    assert.equal(editor.getText(), before);
+  });
+
+  it("yaw yanks word + trailing spaces without mutation", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+    const before = editor.getText();
+    sendKeys(editor, ["y", "a", "w"]);
+    assert.equal(editor.getRegister(), "foo ");
+    assert.equal(editor.getText(), before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WORD text objects — iW / aW with d/c/y
+// ---------------------------------------------------------------------------
+
+describe("WORD text objects — iW / aW", () => {
+  it("ciW changes a punctuation-containing WORD and enters insert mode", () => {
+    const { editor } = createEditorWithSpy("foo path/to-file bar");
+
+    setInternalCursor(editor, 4);
+    sendKeys(editor, ["c", "i", "W"]);
+
+    assert.equal(editor.getRegister(), "path/to-file");
+    assert.equal(editor.getText(), "foo  bar");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("diW deletes a flag WORD without surrounding whitespace", () => {
+    const { editor } = createEditorWithSpy("foo --flag=value bar");
+
+    setInternalCursor(editor, 4);
+    sendKeys(editor, ["d", "i", "W"]);
+
+    assert.equal(editor.getRegister(), "--flag=value");
+    assert.equal(editor.getText(), "foo  bar");
+  });
+
+  it("yiW yanks a WORD without mutation", () => {
+    const { editor } = createEditorWithSpy("foo path/to-file bar");
+    const before = editor.getText();
+
+    setInternalCursor(editor, 4);
+    sendKeys(editor, ["y", "i", "W"]);
+
+    assert.equal(editor.getRegister(), "path/to-file");
+    assert.equal(editor.getText(), before);
+  });
+
+  it("daW includes trailing whitespace when present", () => {
+    const { editor } = createEditorWithSpy("foo path/to-file bar");
+
+    setInternalCursor(editor, 4);
+    sendKeys(editor, ["d", "a", "W"]);
+
+    assert.equal(editor.getRegister(), "path/to-file ");
+    assert.equal(editor.getText(), "foo bar");
+  });
+
+  it("daW includes leading whitespace when no trailing whitespace exists", () => {
+    const { editor } = createEditorWithSpy("foo path/to-file");
+
+    setInternalCursor(editor, 4);
+    sendKeys(editor, ["d", "a", "W"]);
+
+    assert.equal(editor.getRegister(), " path/to-file");
+    assert.equal(editor.getText(), "foo");
+  });
+
+  it("d2iW and d2aW count WORDs using word-object whitespace policy", () => {
+    const { editor: inner } = createEditorWithSpy(
+      "foo path/to-file --flag=value bar",
+    );
+    const { editor: around } = createEditorWithSpy(
+      "foo path/to-file --flag=value bar",
+    );
+
+    setInternalCursor(inner, 4);
+    sendKeys(inner, ["d", "2", "i", "W"]);
+
+    assert.equal(inner.getRegister(), "path/to-file --flag=value");
+    assert.equal(inner.getText(), "foo  bar");
+
+    setInternalCursor(around, 4);
+    sendKeys(around, ["d", "2", "a", "W"]);
+
+    assert.equal(around.getRegister(), "path/to-file --flag=value ");
+    assert.equal(around.getText(), "foo bar");
+  });
+
+  it("chooses next WORD from whitespace or previous WORD when there is no next WORD", () => {
+    const { editor: next } = createEditorWithSpy("foo   path/to-file");
+    const { editor: previous } = createEditorWithSpy("foo/path   ");
+
+    setInternalCursor(next, 3);
+    sendKeys(next, ["d", "i", "W"]);
+
+    assert.equal(next.getRegister(), "path/to-file");
+    assert.equal(next.getText(), "foo   ");
+
+    setInternalCursor(previous, 8);
+    sendKeys(previous, ["d", "i", "W"]);
+
+    assert.equal(previous.getRegister(), "foo/path");
+    assert.equal(previous.getText(), "   ");
+  });
+
+  it("does not cross logical lines", () => {
+    const { editor } = createMultiLineEditor("foo/path\nbar/baz");
+
+    sendKeys(editor, ["d", "2", "i", "W"]);
+
+    assert.equal(editor.getRegister(), "foo/path");
+    assert.equal(editor.getText(), "\nbar/baz");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Quote text objects — i\" / a\" / i' / a' / i` / a` with d/c/y
+// ---------------------------------------------------------------------------
+
+describe("quote text objects", () => {
+  it("supports double-quote text objects on the current quoted string", () => {
+    const scenarios = [
+      {
+        name: 'ci"',
+        keys: ["c", "i", '"'],
+        expectedText: 'say "" now',
+        expectedRegister: "hello",
+        expectedMode: "insert",
+        expectedCursor: { line: 0, col: 5 },
+      },
+      {
+        name: 'di"',
+        keys: ["d", "i", '"'],
+        expectedText: 'say "" now',
+        expectedRegister: "hello",
+        expectedMode: "normal",
+        expectedCursor: { line: 0, col: 5 },
+      },
+      {
+        name: 'yi"',
+        keys: ["y", "i", '"'],
+        expectedText: 'say "hello" now',
+        expectedRegister: "hello",
+        expectedMode: "normal",
+        expectedCursor: { line: 0, col: 6 },
+      },
+      {
+        name: 'ca"',
+        keys: ["c", "a", '"'],
+        expectedText: "say  now",
+        expectedRegister: '"hello"',
+        expectedMode: "insert",
+        expectedCursor: { line: 0, col: 4 },
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createEditorWithSpy('say "hello" now');
+      setInternalCursor(editor, 6);
+
+      sendKeys(editor, scenario.keys);
+
+      assert.equal(
+        editor.getText(),
+        scenario.expectedText,
+        `${scenario.name} text`,
+      );
+      assert.equal(
+        editor.getRegister(),
+        scenario.expectedRegister,
+        `${scenario.name} register`,
+      );
+      assert.equal(
+        editor.getMode(),
+        scenario.expectedMode,
+        `${scenario.name} mode`,
+      );
+      assert.deepEqual(
+        editor.getCursor(),
+        scenario.expectedCursor,
+        `${scenario.name} cursor`,
+      );
+    }
+  });
+
+  it("supports single quotes and backticks", () => {
+    const scenarios = [
+      {
+        name: "single quotes",
+        initial: "say 'hello' now",
+        keys: ["d", "i", "'"],
+        expectedText: "say '' now",
+      },
+      {
+        name: "backticks",
+        initial: "say `hello` now",
+        keys: ["y", "i", "`"],
+        expectedText: "say `hello` now",
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createEditorWithSpy(scenario.initial);
+      setInternalCursor(editor, 6);
+
+      sendKeys(editor, scenario.keys);
+
+      assert.equal(
+        editor.getText(),
+        scenario.expectedText,
+        `${scenario.name} text`,
+      );
+      assert.equal(editor.getRegister(), "hello", `${scenario.name} register`);
+    }
+  });
+
+  it("ignores escaped quote delimiters", () => {
+    const initial = String.raw`say \"not\" "yes" now`;
+    const { editor } = createEditorWithSpy(initial);
+
+    setInternalCursor(editor, 14);
+    sendKeys(editor, ["d", "i", '"']);
+
+    assert.equal(editor.getText(), String.raw`say \"not\" "" now`);
+    assert.equal(editor.getRegister(), "yes");
+  });
+
+  it("does not pair quotes across logical lines", () => {
+    const initial = 'say "hello\nworld" now';
+    const { editor } = createMultiLineEditor(initial);
+    const beforeCursor = { line: 0, col: 5 };
+    editor.setRegister("seed");
+
+    setInternalCursor(editor, beforeCursor.col, beforeCursor.line);
+    sendKeys(editor, ["d", "i", '"']);
+
+    assert.equal(editor.getText(), initial);
+    assert.equal(editor.getRegister(), "seed");
+    assert.deepEqual(editor.getCursor(), beforeCursor);
+  });
+
+  it("empty inner quotes no-op for delete and yank", () => {
+    const scenarios = [
+      { name: "delete", keys: ["d", "i", '"'] },
+      { name: "yank", keys: ["y", "i", '"'] },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createEditorWithSpy('say "" now');
+      const beforeCursor = { line: 0, col: 4 };
+      editor.setRegister("seed");
+
+      setInternalCursor(editor, beforeCursor.col, beforeCursor.line);
+      sendKeys(editor, scenario.keys);
+
+      assert.equal(editor.getText(), 'say "" now', `${scenario.name} text`);
+      assert.equal(editor.getRegister(), "seed", `${scenario.name} register`);
+      assert.deepEqual(
+        editor.getCursor(),
+        beforeCursor,
+        `${scenario.name} cursor`,
+      );
+      assert.equal(editor.getMode(), "normal", `${scenario.name} mode`);
+    }
+  });
+
+  it("empty inner quote change enters insert at the inner start", () => {
+    const { editor } = createEditorWithSpy('say "" now');
+    editor.setRegister("seed");
+
+    setInternalCursor(editor, 4);
+    sendKeys(editor, ["c", "i", '"']);
+
+    assert.equal(editor.getText(), 'say "" now');
+    assert.equal(editor.getRegister(), "seed");
+    assert.equal(editor.getMode(), "insert");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 5 });
+  });
+
+  it("counted quote text objects cancel without mutation or register writes", () => {
+    const { editor } = createEditorWithSpy('say "hello" now');
+    const beforeCursor = { line: 0, col: 6 };
+    editor.setRegister("seed");
+
+    setInternalCursor(editor, beforeCursor.col, beforeCursor.line);
+    sendKeys(editor, ["d", "2", "i", '"']);
+
+    assert.equal(editor.getText(), 'say "hello" now');
+    assert.equal(editor.getRegister(), "seed");
+    assert.deepEqual(editor.getCursor(), beforeCursor);
+    assert.equal(editor.getMode(), "normal");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bracket text objects — i( / a( / i[ / a[ / i{ / a{ aliases
+// ---------------------------------------------------------------------------
+
+describe("bracket text objects", () => {
+  it("supports representative change, delete, and yank bracket text objects", () => {
+    const scenarios = [
+      {
+        name: "ci(",
+        initial: "call(foo) now",
+        cursorCol: 6,
+        keys: ["c", "i", "("],
+        expectedText: "call() now",
+        expectedRegister: "foo",
+        expectedMode: "insert",
+        expectedCursor: { line: 0, col: 5 },
+      },
+      {
+        name: "da(",
+        initial: "call(foo) now",
+        cursorCol: 6,
+        keys: ["d", "a", "("],
+        expectedText: "call now",
+        expectedRegister: "(foo)",
+        expectedMode: "normal",
+        expectedCursor: { line: 0, col: 4 },
+      },
+      {
+        name: "yi[",
+        initial: "arr[foo] now",
+        cursorCol: 5,
+        keys: ["y", "i", "["],
+        expectedText: "arr[foo] now",
+        expectedRegister: "foo",
+        expectedMode: "normal",
+        expectedCursor: { line: 0, col: 5 },
+      },
+      {
+        name: "ya{",
+        initial: "obj {foo} now",
+        cursorCol: 7,
+        keys: ["y", "a", "{"],
+        expectedText: "obj {foo} now",
+        expectedRegister: "{foo}",
+        expectedMode: "normal",
+        expectedCursor: { line: 0, col: 7 },
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createEditorWithSpy(scenario.initial);
+
+      setInternalCursor(editor, scenario.cursorCol);
+      sendKeys(editor, scenario.keys);
+
+      assert.equal(
+        editor.getText(),
+        scenario.expectedText,
+        `${scenario.name} text`,
+      );
+      assert.equal(
+        editor.getRegister(),
+        scenario.expectedRegister,
+        `${scenario.name} register`,
+      );
+      assert.equal(
+        editor.getMode(),
+        scenario.expectedMode,
+        `${scenario.name} mode`,
+      );
+      assert.deepEqual(
+        editor.getCursor(),
+        scenario.expectedCursor,
+        `${scenario.name} cursor`,
+      );
+    }
+  });
+
+  it("supports closing delimiter aliases and b/B aliases", () => {
+    const scenarios = [
+      {
+        name: ") alias",
+        initial: "call(foo)",
+        cursorCol: 6,
+        keys: ["d", "i", ")"],
+        expectedText: "call()",
+      },
+      {
+        name: "b alias",
+        initial: "call(foo)",
+        cursorCol: 6,
+        keys: ["d", "i", "b"],
+        expectedText: "call()",
+      },
+      {
+        name: "] alias",
+        initial: "arr[foo]",
+        cursorCol: 5,
+        keys: ["d", "i", "]"],
+        expectedText: "arr[]",
+      },
+      {
+        name: "} alias",
+        initial: "obj{foo}",
+        cursorCol: 5,
+        keys: ["d", "i", "}"],
+        expectedText: "obj{}",
+      },
+      {
+        name: "B alias",
+        initial: "obj{foo}",
+        cursorCol: 5,
+        keys: ["d", "i", "B"],
+        expectedText: "obj{}",
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createEditorWithSpy(scenario.initial);
+
+      setInternalCursor(editor, scenario.cursorCol);
+      sendKeys(editor, scenario.keys);
+
+      assert.equal(
+        editor.getText(),
+        scenario.expectedText,
+        `${scenario.name} text`,
+      );
+      assert.equal(editor.getRegister(), "foo", `${scenario.name} register`);
+    }
+  });
+
+  it("uses the smallest nested parenthesis pair", () => {
+    const { editor } = createEditorWithSpy("a(b(c)d)e");
+
+    setInternalCursor(editor, 4);
+    sendKeys(editor, ["d", "i", "("]);
+
+    assert.equal(editor.getText(), "a(b()d)e");
+    assert.equal(editor.getRegister(), "c");
+  });
+
+  it("yanks cross-line brace ranges", () => {
+    const initial = "fn {\n  x\n}\nend";
+    const { editor } = createMultiLineEditor(initial);
+
+    setInternalCursor(editor, 2, 1);
+    sendKeys(editor, ["y", "a", "{"]);
+
+    assert.equal(editor.getText(), initial);
+    assert.equal(editor.getRegister(), "{\n  x\n}");
+    assert.deepEqual(editor.getCursor(), { line: 1, col: 2 });
+  });
+
+  it("counts the cursor on either delimiter as inside", () => {
+    const scenarios = [
+      { name: "opening delimiter", cursorCol: 4 },
+      { name: "closing delimiter", cursorCol: 8 },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createEditorWithSpy("call(foo)");
+
+      setInternalCursor(editor, scenario.cursorCol);
+      sendKeys(editor, ["d", "i", "("]);
+
+      assert.equal(editor.getText(), "call()", `${scenario.name} text`);
+      assert.equal(editor.getRegister(), "foo", `${scenario.name} register`);
+    }
+  });
+
+  it("empty inner brackets no-op for delete and yank", () => {
+    const scenarios = [
+      { name: "delete", keys: ["d", "i", "("] },
+      { name: "yank", keys: ["y", "i", "("] },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createEditorWithSpy("call() now");
+      const beforeCursor = { line: 0, col: 4 };
+      editor.setRegister("seed");
+
+      setInternalCursor(editor, beforeCursor.col, beforeCursor.line);
+      sendKeys(editor, scenario.keys);
+
+      assert.equal(editor.getText(), "call() now", `${scenario.name} text`);
+      assert.equal(editor.getRegister(), "seed", `${scenario.name} register`);
+      assert.deepEqual(
+        editor.getCursor(),
+        beforeCursor,
+        `${scenario.name} cursor`,
+      );
+      assert.equal(editor.getMode(), "normal", `${scenario.name} mode`);
+    }
+  });
+
+  it("empty inner bracket change enters insert at the inner start", () => {
+    const { editor } = createEditorWithSpy("call() now");
+    editor.setRegister("seed");
+
+    setInternalCursor(editor, 4);
+    sendKeys(editor, ["c", "i", "("]);
+
+    assert.equal(editor.getText(), "call() now");
+    assert.equal(editor.getRegister(), "seed");
+    assert.equal(editor.getMode(), "insert");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 5 });
+  });
+
+  it("counted bracket text objects cancel without mutation or register writes", () => {
+    const scenarios = [
+      {
+        name: "2ci(",
+        initial: "call(foo)",
+        cursorCol: 6,
+        keys: ["2", "c", "i", "("],
+      },
+      {
+        name: "y2a{",
+        initial: "obj{foo}",
+        cursorCol: 5,
+        keys: ["y", "2", "a", "{"],
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createEditorWithSpy(scenario.initial);
+      const beforeCursor = { line: 0, col: scenario.cursorCol };
+      editor.setRegister("seed");
+
+      setInternalCursor(editor, beforeCursor.col, beforeCursor.line);
+      sendKeys(editor, scenario.keys);
+
+      assert.equal(editor.getText(), scenario.initial, `${scenario.name} text`);
+      assert.equal(editor.getRegister(), "seed", `${scenario.name} register`);
+      assert.deepEqual(
+        editor.getCursor(),
+        beforeCursor,
+        `${scenario.name} cursor`,
+      );
+      assert.equal(editor.getMode(), "normal", `${scenario.name} mode`);
+    }
+  });
+});
+
+describe("delimited text objects at end of line", () => {
+  it("resolves bracket objects from $ on a non-final line", () => {
+    const { editor } = createMultiLineEditor("call(foo)\nbar");
+
+    sendKeys(editor, ["$", "d", "i", "("]);
+
+    assert.equal(editor.getText(), "call()\nbar");
+    assert.equal(editor.getRegister(), "foo");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 5 });
+  });
+
+  it("resolves quote objects from $ on a non-final line", () => {
+    const { editor } = createMultiLineEditor('say "hi"\nnext');
+
+    sendKeys(editor, ["$", "d", "i", '"']);
+
+    assert.equal(editor.getText(), 'say ""\nnext');
+    assert.equal(editor.getRegister(), "hi");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 5 });
+  });
+
+  it("resolves delimiter objects from $ on the final non-empty line", () => {
+    const scenarios = [
+      {
+        name: "bracket",
+        initial: "before\ncall(foo)",
+        cursorLine: 1,
+        keys: ["$", "d", "i", "("],
+        expectedText: "before\ncall()",
+        expectedRegister: "foo",
+        expectedCursor: { line: 1, col: 5 },
+      },
+      {
+        name: "quote",
+        initial: 'before\nsay "hi"',
+        cursorLine: 1,
+        keys: ["$", "d", "i", '"'],
+        expectedText: 'before\nsay ""',
+        expectedRegister: "hi",
+        expectedCursor: { line: 1, col: 5 },
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createMultiLineEditor(scenario.initial);
+
+      setInternalCursor(editor, 0, scenario.cursorLine);
+      sendKeys(editor, scenario.keys);
+
+      assert.equal(
+        editor.getText(),
+        scenario.expectedText,
+        `${scenario.name} text`,
+      );
+      assert.equal(
+        editor.getRegister(),
+        scenario.expectedRegister,
+        `${scenario.name} register`,
+      );
+      assert.deepEqual(
+        editor.getCursor(),
+        scenario.expectedCursor,
+        `${scenario.name} cursor`,
+      );
+    }
+  });
+
+  it("cancels delimiter objects from a final empty trailing-newline line", () => {
+    const scenarios = [
+      { name: "bracket", keys: ["d", "i", "("] },
+      { name: "quote", keys: ["c", "i", '"'] },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createMultiLineEditor("call(foo)\n");
+      const beforeCursor = { line: 1, col: 0 };
+      editor.setRegister("seed");
+
+      setInternalCursor(editor, beforeCursor.col, beforeCursor.line);
+      sendKeys(editor, scenario.keys);
+
+      assert.equal(editor.getText(), "call(foo)\n", `${scenario.name} text`);
+      assert.equal(editor.getRegister(), "seed", `${scenario.name} register`);
+      assert.deepEqual(
+        editor.getCursor(),
+        beforeCursor,
+        `${scenario.name} cursor`,
+      );
+      assert.equal(editor.getMode(), "normal", `${scenario.name} mode`);
+    }
+  });
+
+  it("cancels delimiter objects in an empty buffer", () => {
+    const scenarios = [
+      { name: "delete quote", keys: ["d", "i", '"'] },
+      { name: "change bracket", keys: ["c", "i", "("] },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createEditorWithSpy("");
+      const beforeCursor = { line: 0, col: 0 };
+      editor.setRegister("seed");
+
+      sendKeys(editor, scenario.keys);
+
+      assert.equal(editor.getText(), "", `${scenario.name} text`);
+      assert.equal(editor.getRegister(), "seed", `${scenario.name} register`);
+      assert.deepEqual(
+        editor.getCursor(),
+        beforeCursor,
+        `${scenario.name} cursor`,
+      );
+      assert.equal(editor.getMode(), "normal", `${scenario.name} mode`);
+    }
+  });
+});
+
+describe("text object cancellation hardening", () => {
+  it("unsupported object keys after di, ci, and yi cancel before the next normal key", () => {
+    const scenarios = [
+      { name: "diq", keys: ["d", "i", "q"] },
+      { name: "ciq", keys: ["c", "i", "q"] },
+      { name: "yiq", keys: ["y", "i", "q"] },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createEditorWithSpy("foo bar");
+      const beforeCursor = editor.getCursor();
+      editor.setRegister("seed");
+
+      sendKeys(editor, scenario.keys);
+
+      assert.equal(
+        editor.getText(),
+        "foo bar",
+        `${scenario.name} cancellation text`,
+      );
+      assert.equal(
+        editor.getRegister(),
+        "seed",
+        `${scenario.name} cancellation register`,
+      );
+      assert.deepEqual(
+        editor.getCursor(),
+        beforeCursor,
+        `${scenario.name} cancellation cursor`,
+      );
+      assert.equal(
+        editor.getMode(),
+        "normal",
+        `${scenario.name} cancellation mode`,
+      );
+
+      sendKeys(editor, ["x"]);
+
+      assert.equal(
+        editor.getText(),
+        "oo bar",
+        `${scenario.name} next key text`,
+      );
+      assert.equal(
+        editor.getRegister(),
+        "f",
+        `${scenario.name} next key register`,
+      );
+    }
+  });
+
+  it("unmatched delimiters cancel without mutation or register writes", () => {
+    const scenarios = [
+      {
+        name: 'di"',
+        initial: 'say "hello',
+        cursorCol: 5,
+        keys: ["d", "i", '"'],
+      },
+      {
+        name: "ci(",
+        initial: "call(foo",
+        cursorCol: 6,
+        keys: ["c", "i", "("],
+      },
+      {
+        name: "yi{",
+        initial: "obj {foo",
+        cursorCol: 6,
+        keys: ["y", "i", "{"],
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createEditorWithSpy(scenario.initial);
+      const beforeCursor = { line: 0, col: scenario.cursorCol };
+      editor.setRegister("seed");
+
+      setInternalCursor(editor, beforeCursor.col, beforeCursor.line);
+      sendKeys(editor, scenario.keys);
+
+      assert.equal(editor.getText(), scenario.initial, `${scenario.name} text`);
+      assert.equal(editor.getRegister(), "seed", `${scenario.name} register`);
+      assert.deepEqual(
+        editor.getCursor(),
+        beforeCursor,
+        `${scenario.name} cursor`,
+      );
+      assert.equal(editor.getMode(), "normal", `${scenario.name} mode`);
+    }
+  });
+
+  it("unmatched delimiter cancellation is not sticky", () => {
+    const initial = 'say "hello';
+    const { editor } = createEditorWithSpy(initial);
+    const beforeCursor = { line: 0, col: 5 };
+    editor.setRegister("seed");
+
+    setInternalCursor(editor, beforeCursor.col, beforeCursor.line);
+    sendKeys(editor, ["d", "i", '"']);
+
+    assert.equal(editor.getText(), initial);
+    assert.equal(editor.getRegister(), "seed");
+    assert.deepEqual(editor.getCursor(), beforeCursor);
+
+    sendKeys(editor, ["x"]);
+
+    assert.equal(editor.getText(), 'say "ello');
+    assert.equal(editor.getRegister(), "h");
+  });
+
+  it("counted delimited examples cancel without mutation or register writes", () => {
+    const scenarios = [
+      {
+        name: 'd2i"',
+        initial: 'say "hello" now',
+        cursorCol: 6,
+        keys: ["d", "2", "i", '"'],
+      },
+      {
+        name: "2ci(",
+        initial: "call(foo)",
+        cursorCol: 6,
+        keys: ["2", "c", "i", "("],
+      },
+      {
+        name: "y2a{",
+        initial: "obj {foo}",
+        cursorCol: 6,
+        keys: ["y", "2", "a", "{"],
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createEditorWithSpy(scenario.initial);
+      const beforeCursor = { line: 0, col: scenario.cursorCol };
+      editor.setRegister("seed");
+
+      setInternalCursor(editor, beforeCursor.col, beforeCursor.line);
+      sendKeys(editor, scenario.keys);
+
+      assert.equal(editor.getText(), scenario.initial, `${scenario.name} text`);
+      assert.equal(editor.getRegister(), "seed", `${scenario.name} register`);
+      assert.deepEqual(
+        editor.getCursor(),
+        beforeCursor,
+        `${scenario.name} cursor`,
+      );
+      assert.equal(editor.getMode(), "normal", `${scenario.name} mode`);
+    }
+  });
+
+  it("counted yank word and WORD text objects remain unsupported", () => {
+    const scenarios = [
+      {
+        name: "y2iw",
+        initial: "foo bar",
+        cursorCol: 0,
+        keys: ["y", "2", "i", "w"],
+      },
+      {
+        name: "2yiW",
+        initial: "foo path/to-file bar",
+        cursorCol: 4,
+        keys: ["2", "y", "i", "W"],
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createEditorWithSpy(scenario.initial);
+      const beforeCursor = { line: 0, col: scenario.cursorCol };
+      editor.setRegister("seed");
+
+      setInternalCursor(editor, beforeCursor.col, beforeCursor.line);
+      sendKeys(editor, scenario.keys);
+
+      assert.equal(editor.getText(), scenario.initial, `${scenario.name} text`);
+      assert.equal(editor.getRegister(), "seed", `${scenario.name} register`);
+      assert.deepEqual(
+        editor.getCursor(),
+        beforeCursor,
+        `${scenario.name} cursor`,
+      );
+      assert.equal(editor.getMode(), "normal", `${scenario.name} mode`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Single-key edit commands — x / s / S / D / C
+// ---------------------------------------------------------------------------
+
+describe("single-key edits — x / s / S / D / C", () => {
+  it("x: deletes char under cursor, normal mode", () => {
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["x"]);
+    assert.equal(editor.getRegister(), "h");
+    assert.equal(editor.getText(), "ello");
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("x: register written correctly", () => {
+    const { editor, clipboardWrites } = createEditorWithSpy("hello");
+    sendKeys(editor, ["x"]);
+    assert.deepEqual(clipboardWrites, ["h"]);
+  });
+
+  it("s: deletes char under cursor, enters insert mode", () => {
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["s"]);
+    assert.equal(editor.getRegister(), "h");
+    assert.equal(editor.getText(), "ello");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("S: clears line content, enters insert mode", () => {
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["S"]);
+    assert.equal(editor.getRegister(), "hello");
+    assert.equal(editor.getText(), "");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("D: deletes from cursor to end of line", () => {
+    chk("hello world", ["D"], "", "hello world");
+  });
+
+  it("D from mid-line: deletes only tail", () => {
+    // navigate to col 5 (' '), D should delete " world"
+    const { editor } = createEditorWithSpy("hello world");
+    sendKeys(editor, ["w", "D"]); // w moves to "world" (col 6), D deletes from there
+    assert.equal(editor.getRegister(), "world");
+    assert.equal(editor.getText(), "hello ");
+  });
+
+  it("C: deletes to EOL, enters insert mode", () => {
+    const { editor } = createEditorWithSpy("hello world");
+    sendKeys(editor, ["C"]);
+    assert.equal(editor.getRegister(), "hello world");
+    assert.equal(editor.getText(), "");
+    assert.equal(editor.getMode(), "insert");
+  });
+});
+
+describe("dot repeat — .", () => {
+  it("repeats the last single-key normal-mode edit", () => {
+    const { editor } = createEditorWithSpy("abcd");
+
+    sendKeys(editor, ["x", "."]);
+
+    assert.equal(editor.getText(), "cd");
+    assert.equal(editor.getRegister(), "b");
+  });
+
+  it("replays the original command count when repeating a counted edit", () => {
+    const { editor } = createEditorWithSpy("abcdef");
+
+    sendKeys(editor, ["2", "x", "."]);
+
+    assert.equal(editor.getText(), "ef");
+    assert.equal(editor.getRegister(), "cd");
+  });
+
+  it("uses a count before . to repeat the stored change multiple times", () => {
+    const { editor } = createEditorWithSpy("abcde");
+
+    sendKeys(editor, ["x", "3", "."]);
+
+    assert.equal(editor.getText(), "e");
+    assert.equal(editor.getRegister(), "d");
+  });
+
+  it("repeats operator-pending changes including their motions", () => {
+    const { editor } = createEditorWithSpy("one two three");
+
+    sendKeys(editor, ["d", "w", "."]);
+
+    assert.equal(editor.getText(), "three");
+    assert.equal(editor.getRegister(), "two ");
+  });
+
+  it("repeats text-object deletes", () => {
+    const { editor } = createEditorWithSpy("foo bar baz");
+
+    sendKeys(editor, ["d", "i", "w", "."]);
+
+    assert.equal(editor.getText(), "  baz");
+    assert.equal(editor.getRegister(), "bar");
+  });
+
+  it("repeats text-object changes with captured insert text", () => {
+    const { editor } = createEditorWithSpy("foo bar baz");
+
+    sendKeys(editor, ["c", "i", "w", "X", "\x1b", "."]);
+
+    assert.equal(editor.getText(), "X X baz");
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("repeats put commands", () => {
+    const p = createEditorWithSpy("abc").editor;
+    p.setRegister("X");
+    sendKeys(p, ["p", "."]);
+
+    const P = createEditorWithSpy("abc").editor;
+    P.setRegister("X");
+    sendKeys(P, ["P", "."]);
+
+    assert.equal(p.getText(), "aXbXc");
+    assert.equal(P.getText(), "XXabc");
+  });
+
+  it("repeats line joins", () => {
+    const join = createMultiLineEditor("a\nb\nc").editor;
+    sendKeys(join, ["J", "."]);
+
+    const rawJoin = createMultiLineEditor("a\nb\nc").editor;
+    sendKeys(rawJoin, ["g", "J", "."]);
+
+    assert.equal(join.getText(), "a b c");
+    assert.equal(rawJoin.getText(), "abc");
+  });
+
+  it("repeats replace commands with their replacement character", () => {
+    const { editor } = createEditorWithSpy("abc");
+
+    sendKeys(editor, ["r", "Z", "l", "."]);
+
+    assert.equal(editor.getText(), "ZZc");
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("repeats insert text captured by an insert-mode change", () => {
+    const { editor } = createEditorWithSpy("X");
+
+    sendKeys(editor, ["i", "a", "b", "c", "\x1b", "0", "."]);
+
+    assert.equal(editor.getText(), "abcabcX");
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("does not let non-mutating yanks replace the last repeatable change", () => {
+    const { editor } = createEditorWithSpy("abc");
+
+    sendKeys(editor, ["x", "Y", "."]);
+
+    assert.equal(editor.getText(), "c");
+    assert.equal(editor.getRegister(), "b");
+  });
+});
+
+describe("Universal Counts: Edits and Put", () => {
+  it("3x deletes three chars under cursor", () => {
+    const { editor } = createEditorWithSpy("abcdef");
+
+    sendKeys(editor, ["3", "x"]);
+
+    assert.equal(editor.getText(), "def");
+    assert.equal(editor.getRegister(), "abc");
+  });
+
+  it("2x near EOL deletes only available chars", () => {
+    const { editor } = createEditorWithSpy("abcdef");
+
+    sendKeys(editor, ["l", "l", "l", "l", "2", "x"]);
+
+    assert.equal(editor.getText(), "abcd");
+    assert.equal(editor.getRegister(), "ef");
+  });
+
+  it("3p pastes register text three times after cursor", () => {
+    const { editor } = createEditorWithSpy("X");
+    editor.setRegister("ab");
+
+    sendKeys(editor, ["3", "p"]);
+
+    assert.equal(editor.getText(), "Xababab");
+  });
+
+  it("3P pastes register text three times before cursor", () => {
+    const { editor } = createEditorWithSpy("X");
+    editor.setRegister("ab");
+
+    sendKeys(editor, ["3", "P"]);
+
+    assert.equal(editor.getText(), "abababX");
+  });
+
+  it("2s deletes two chars and enters insert mode", () => {
+    const { editor } = createEditorWithSpy("abcdef");
+
+    sendKeys(editor, ["2", "s"]);
+
+    assert.equal(editor.getText(), "cdef");
+    assert.equal(editor.getRegister(), "ab");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("2S clears line once and enters insert mode", () => {
+    const { editor } = createEditorWithSpy("abcdef");
+
+    sendKeys(editor, ["2", "S"]);
+
+    assert.equal(editor.getText(), "");
+    assert.equal(editor.getRegister(), "abcdef");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("2D deletes to EOL once", () => {
+    const { editor } = createEditorWithSpy("abcdef");
+
+    sendKeys(editor, ["2", "D"]);
+
+    assert.equal(editor.getText(), "");
+    assert.equal(editor.getRegister(), "abcdef");
+  });
+
+  it("2C deletes to EOL and enters insert mode", () => {
+    const { editor } = createEditorWithSpy("abcdef");
+
+    sendKeys(editor, ["2", "C"]);
+
+    assert.equal(editor.getText(), "");
+    assert.equal(editor.getRegister(), "abcdef");
+    assert.equal(editor.getMode(), "insert");
+  });
+});
+
+describe("Universal Counts: Char Motions", () => {
+  it("3fx moves to the third forward match", () => {
+    const { editor } = createEditorWithSpy("axbxcxd");
+
+    sendKeys(editor, ["3", "f", "x"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 5 });
+  });
+
+  it("3Fx moves to the third backward match", () => {
+    const { editor } = createEditorWithSpy("dxcxbxa");
+
+    sendKeys(editor, ["$", "3", "F", "x"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 1 });
+  });
+
+  it("3tx moves to one before the third forward match", () => {
+    const { editor } = createEditorWithSpy("axbxcxd");
+
+    sendKeys(editor, ["3", "t", "x"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 4 });
+  });
+
+  it("d2tx deletes through the char before the second forward match", () => {
+    const { editor } = createEditorWithSpy("axbxcxd");
+
+    sendKeys(editor, ["d", "2", "t", "x"]);
+
+    assert.equal(editor.getText(), "xcxd");
+    assert.equal(editor.getRegister(), "axb");
+  });
+
+  it("3TX moves backward one before the third backward match", () => {
+    const { editor } = createEditorWithSpy("dxcxbxa");
+
+    sendKeys(editor, ["$", "3", "T", "x"]);
+
+    // 3rd x from right is at col 1, T stops one after = col 2
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 2 });
+  });
+
+  it("2; repeats the last char-find motion twice", () => {
+    const { editor } = createEditorWithSpy("axbxcxd");
+
+    sendKeys(editor, ["f", "x", "2", ";"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 5 });
+  });
+});
+
+describe("Universal Counts: Word Motions", () => {
+  it("3w moves to the start of qux (3 word-forward steps)", () => {
+    const { editor } = createEditorWithSpy("foo bar baz qux");
+
+    sendKeys(editor, ["3", "w"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 12 });
+  });
+
+  it("2b from baz moves to the start of foo", () => {
+    const { editor } = createEditorWithSpy("foo bar baz");
+
+    sendKeys(editor, ["w", "w", "2", "b"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+  });
+
+  it("2e from start lands at end of bar", () => {
+    const { editor } = createEditorWithSpy("foo bar baz");
+
+    sendKeys(editor, ["2", "e"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 6 });
+  });
+
+  it("WORD standalone motions W/B/E use whitespace-delimited semantics", () => {
+    const { editor } = createEditorWithSpy("foo-bar   baz");
+
+    sendKeys(editor, ["W"]);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 10 });
+
+    sendKeys(editor, ["B"]);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+
+    sendKeys(editor, ["E"]);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 6 });
+  });
+
+  it("2W moves by WORD tokens (counted standalone)", () => {
+    const { editor } = createEditorWithSpy("foo-bar   baz qux");
+
+    sendKeys(editor, ["2", "W"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 14 });
+  });
+
+  it("3B from EOL walks backward across WORD tokens", () => {
+    const { editor } = createEditorWithSpy("foo-bar   baz qux");
+
+    sendKeys(editor, ["$", "3", "B"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+  });
+
+  it("2E lands on end of second WORD token", () => {
+    const { editor } = createEditorWithSpy("foo-bar   baz qux");
+
+    sendKeys(editor, ["2", "E"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 12 });
+  });
+
+  it("lowercase w keeps word-class behavior next to punctuation", () => {
+    const { editor: lowercase } = createEditorWithSpy("foo-bar baz");
+    const { editor: uppercase } = createEditorWithSpy("foo-bar baz");
+
+    sendKeys(lowercase, ["w"]);
+    sendKeys(uppercase, ["W"]);
+
+    assert.deepEqual(lowercase.getCursor(), { line: 0, col: 3 });
+    assert.deepEqual(uppercase.getCursor(), { line: 0, col: 8 });
+  });
+
+  it("d2w deletes foo bar and leaves baz", () => {
+    const { editor } = createEditorWithSpy("foo bar baz");
+
+    sendKeys(editor, ["d", "2", "w"]);
+
+    assert.equal(editor.getText(), "baz");
+  });
+
+  it("d2aw deletes two words from bar and leaves foo", () => {
+    const { editor } = createEditorWithSpy("foo bar baz");
+
+    sendKeys(editor, ["w", "d", "2", "a", "w"]);
+
+    assert.equal(editor.getText(), "foo");
+  });
+
+  it("maintains differential parity with count > 1 (3w matches three sequential w)", () => {
+    const { editor: e1 } = createEditorWithSpy("foo bar baz qux");
+    const { editor: e2 } = createEditorWithSpy("foo bar baz qux");
+
+    sendKeys(e1, ["3", "w"]);
+    sendKeys(e2, ["w", "w", "w"]);
+
+    assert.deepEqual(e1.getCursor(), e2.getCursor());
+  });
+
+  it("w skips correctly after a non-ascii grapheme", () => {
+    const { editor } = createEditorWithSpy("中 x");
+
+    sendKeys(editor, ["l", "w"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 2 });
+  });
+
+  it("w skips correctly after an emoji grapheme", () => {
+    const { editor } = createEditorWithSpy("😀 x");
+
+    sendKeys(editor, ["l", "w"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 3 });
+  });
+});
+
+describe("Universal Counts: Change and Nav", () => {
+  it("c2w deletes two words and enters insert mode", () => {
+    const { editor } = createEditorWithSpy("foo bar baz");
+
+    sendKeys(editor, ["c", "2", "w"]);
+
+    assert.equal(editor.getText(), "baz");
+    assert.equal(editor.getMode(), "insert");
+  });
+
+  it("3j moves cursor down three lines", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc\nd\ne");
+
+    sendKeys(editor, ["3", "j"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 3, col: 0 });
+  });
+
+  it("3l moves cursor right by three columns", () => {
+    const { editor } = createEditorWithSpy("abcdef");
+
+    sendKeys(editor, ["3", "l"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 3 });
+  });
+
+  it("3h moves cursor left by three columns", () => {
+    const { editor } = createEditorWithSpy("abcdef");
+
+    sendKeys(editor, ["$", "h", "3", "h"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 2 });
+  });
+
+  it("3k moves cursor up three lines", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc\nd\ne");
+
+    sendKeys(editor, ["G", "3", "k"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 1, col: 0 });
+  });
+
+  it("j moves by logical lines across wrapped content", () => {
+    const wrappedLine = "x".repeat(200);
+    const { editor } = createMultiLineEditor(`top\n${wrappedLine}\nbottom`);
+
+    sendKeys(editor, ["j", "j"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 2, col: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// EOL / newline edge cases  (Task 7)
+// ---------------------------------------------------------------------------
+
+describe("EOL and newline semantics", () => {
+  it("D at EOL captures '\\n' in register when next line exists", () => {
+    const { editor, clipboardWrites } = createMultiLineEditor("line1\nline2");
+    // cursor at col 0 of line 0; go to EOL
+    sendKeys(editor, ["$"]); // CTRL_E → col past last char (col 5 for "line1")
+    sendKeys(editor, ["D"]);
+    assert.equal(editor.getRegister(), "\n");
+    assert.deepEqual(clipboardWrites, ["\n"]);
+    // CTRL_K at EOL joins the two lines
+    assert.equal(editor.getText(), "line1line2");
+  });
+
+  it("d$ at EOL matches D behavior (captures newline and joins lines)", () => {
+    const { editor, clipboardWrites } = createMultiLineEditor("line1\nline2");
+    sendKeys(editor, ["$", "d", "$"]);
+
+    assert.equal(editor.getRegister(), "\n");
+    assert.deepEqual(clipboardWrites, ["\n"]);
+    assert.equal(editor.getText(), "line1line2");
+  });
+
+  it("D at EOL on last line is a no-op (register stays empty)", () => {
+    const { editor } = createEditorWithSpy("hello");
+    // cursor col 0, go to EOL
+    sendKeys(editor, ["$"]);
+    sendKeys(editor, ["D"]);
+    // col >= line.length AND no next line → deleted = "" → no-op (register empty)
+    assert.equal(editor.getRegister(), "");
+    assert.equal(editor.getText(), "hello");
+  });
+
+  it("x at past-EOL position is a no-op (does not join next line)", () => {
+    const { editor } = createMultiLineEditor("line1\nline2");
+    sendKeys(editor, ["$"]); // move to col 5 (past end of "line1")
+    const before = editor.getText();
+    sendKeys(editor, ["x"]);
+    assert.equal(editor.getText(), before); // text unchanged
+    assert.equal(editor.getRegister(), ""); // nothing captured
+  });
+
+  it("x on last char of line deletes only that char, does not join lines", () => {
+    const { editor } = createMultiLineEditor("line1\nline2");
+    // "e" motion: end of word in "line1" → col 4 ('1')
+    sendKeys(editor, ["e", "x"]);
+    assert.equal(editor.getRegister(), "1");
+    assert.equal(editor.getText(), "line\nline2"); // only '1' gone, newline intact
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Word motion path selection (line-local fast path vs canonical fallback)
+// ---------------------------------------------------------------------------
+
+describe("word motion path selection", () => {
+  it("line-local w avoids canonical absolute scanner", () => {
+    const { editor } = createEditorWithSpy("alpha beta");
+
+    const raw = getRawEditor(editor);
+    const original = raw.findWordTargetInText.bind(raw);
+    let calls = 0;
+
+    raw.findWordTargetInText = (...args: FindWordTargetInTextArgs) => {
+      calls++;
+      return original(...args);
+    };
+
+    sendKeys(editor, ["w"]);
+    assert.equal(calls, 0);
+  });
+
+  it("line-local e avoids canonical absolute scanner", () => {
+    const { editor } = createEditorWithSpy("alpha beta");
+
+    const raw = getRawEditor(editor);
+    const original = raw.findWordTargetInText.bind(raw);
+    let calls = 0;
+
+    raw.findWordTargetInText = (...args: FindWordTargetInTextArgs) => {
+      calls++;
+      return original(...args);
+    };
+
+    sendKeys(editor, ["e"]);
+    assert.equal(calls, 0);
+  });
+
+  it("line-local b avoids canonical absolute scanner", () => {
+    const { editor } = createEditorWithSpy("alpha beta");
+    sendKeys(editor, ["w"]);
+
+    const raw = getRawEditor(editor);
+    const original = raw.findWordTargetInText.bind(raw);
+    let calls = 0;
+
+    raw.findWordTargetInText = (...args: FindWordTargetInTextArgs) => {
+      calls++;
+      return original(...args);
+    };
+
+    sendKeys(editor, ["b"]);
+    assert.equal(calls, 0);
+  });
+
+  it("line-local W/E/B thread WORD semantic class through cache lookup", () => {
+    const scenarios: Array<{ motion: string; setup?: string[] }> = [
+      { motion: "W" },
+      { motion: "E" },
+      { motion: "B", setup: ["W"] },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createEditorWithSpy("foo-bar baz");
+      const raw = getRawEditor(editor);
+      const original = raw.wordBoundaryCache.tryFindTarget.bind(
+        raw.wordBoundaryCache,
+      );
+      let seenSemanticClass: string | null = null;
+
+      raw.wordBoundaryCache.tryFindTarget = (...args: TryFindTargetArgs) => {
+        seenSemanticClass = String(args[4] ?? "");
+        return original(...args);
+      };
+
+      if (scenario.setup) {
+        sendKeys(editor, scenario.setup);
+      }
+      sendKeys(editor, [scenario.motion]);
+      assert.equal(
+        seenSemanticClass,
+        "WORD",
+        `${scenario.motion} should use WORD class`,
+      );
+    }
+  });
+
+  it("cache uncertainty falls back to canonical absolute scanner", () => {
+    const { editor } = createEditorWithSpy("alpha beta");
+
+    const raw = getRawEditor(editor);
+    const original = raw.findWordTargetInText.bind(raw);
+    let calls = 0;
+
+    raw.findWordTargetInText = (...args: FindWordTargetInTextArgs) => {
+      calls++;
+      return original(...args);
+    };
+
+    raw.wordBoundaryCache.tryFindTarget = () => null;
+
+    sendKeys(editor, ["w"]);
+    assert.ok(calls > 0);
+  });
+
+  it("w at EOL falls back to canonical absolute scanner", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+    sendKeys(editor, ["$"]);
+
+    const raw = getRawEditor(editor);
+    const original = raw.findWordTargetInText.bind(raw);
+    let calls = 0;
+
+    raw.findWordTargetInText = (...args: FindWordTargetInTextArgs) => {
+      calls++;
+      return original(...args);
+    };
+
+    sendKeys(editor, ["w"]);
+    assert.ok(calls > 0);
+  });
+
+  it("e at EOL falls back to canonical absolute scanner", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+    sendKeys(editor, ["$"]);
+
+    const raw = getRawEditor(editor);
+    const original = raw.findWordTargetInText.bind(raw);
+    let calls = 0;
+
+    raw.findWordTargetInText = (...args: FindWordTargetInTextArgs) => {
+      calls++;
+      return original(...args);
+    };
+
+    sendKeys(editor, ["e"]);
+    assert.ok(calls > 0);
+  });
+
+  it("b from BOL falls back to canonical absolute scanner", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+    sendKeys(editor, ["j", "0"]);
+
+    const raw = getRawEditor(editor);
+    const original = raw.findWordTargetInText.bind(raw);
+    let calls = 0;
+
+    raw.findWordTargetInText = (...args: FindWordTargetInTextArgs) => {
+      calls++;
+      return original(...args);
+    };
+
+    sendKeys(editor, ["b"]);
+    assert.ok(calls > 0);
+  });
+
+  it("W/E at EOL and B at BOL fall back to canonical absolute scanner", () => {
+    const scenarios: Array<{
+      name: string;
+      initial: string;
+      setup: string[];
+      motion: string;
+    }> = [
+      { name: "W@EOL", initial: "foo\nbar", setup: ["$"], motion: "W" },
+      { name: "E@EOL", initial: "foo\nbar", setup: ["$"], motion: "E" },
+      { name: "B@BOL", initial: "foo\nbar", setup: ["j", "0"], motion: "B" },
+    ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createMultiLineEditor(scenario.initial);
+      const raw = getRawEditor(editor);
+      const original = raw.findWordTargetInText.bind(raw);
+      let calls = 0;
+
+      raw.findWordTargetInText = (...args: FindWordTargetInTextArgs) => {
+        calls++;
+        return original(...args);
+      };
+
+      sendKeys(editor, [...scenario.setup, scenario.motion]);
+      assert.ok(calls > 0, `${scenario.name} should fall back`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Operator word-motion path selection
+// ---------------------------------------------------------------------------
+
+describe("operator word-motion path selection", () => {
+  it("line-local d/c/y + w/e/b avoid canonical absolute scanner", () => {
+    const scenarios: Array<{ name: string; initial: string; keys: string[] }> =
+      [
+        { name: "dw", initial: "alpha beta", keys: ["d", "w"] },
+        { name: "de", initial: "alpha beta", keys: ["d", "e"] },
+        { name: "db", initial: "alpha beta", keys: ["w", "d", "b"] },
+        { name: "cw", initial: "alpha beta", keys: ["c", "w"] },
+        { name: "ce", initial: "alpha beta", keys: ["c", "e"] },
+        { name: "cb", initial: "alpha beta", keys: ["w", "c", "b"] },
+        { name: "yw", initial: "alpha beta", keys: ["y", "w"] },
+        { name: "ye", initial: "alpha beta", keys: ["y", "e"] },
+        { name: "yb", initial: "alpha beta", keys: ["w", "y", "b"] },
+        { name: "dW", initial: "alpha-beta gamma", keys: ["d", "W"] },
+        { name: "dE", initial: "alpha-beta gamma", keys: ["d", "E"] },
+        { name: "dB", initial: "alpha-beta gamma", keys: ["W", "d", "B"] },
+        { name: "cW", initial: "alpha-beta gamma", keys: ["c", "W"] },
+        { name: "cE", initial: "alpha-beta gamma", keys: ["c", "E"] },
+        { name: "cB", initial: "alpha-beta gamma", keys: ["W", "c", "B"] },
+        { name: "yW", initial: "alpha-beta gamma", keys: ["y", "W"] },
+        { name: "yE", initial: "alpha-beta gamma", keys: ["y", "E"] },
+        { name: "yB", initial: "alpha-beta gamma", keys: ["W", "y", "B"] },
+      ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createEditorWithSpy(scenario.initial);
+      const raw = getRawEditor(editor);
+      const original = raw.findWordTargetInText.bind(raw);
+      let calls = 0;
+
+      raw.findWordTargetInText = (...args: FindWordTargetInTextArgs) => {
+        calls++;
+        return original(...args);
+      };
+
+      sendKeys(editor, scenario.keys);
+      assert.equal(calls, 0, `${scenario.name} should stay line-local`);
+    }
+  });
+
+  it("cross-line operator word motions fall back to canonical scanner", () => {
+    const scenarios: Array<{ name: string; initial: string; keys: string[] }> =
+      [
+        { name: "dw@EOL", initial: "foo\nbar", keys: ["$", "d", "w"] },
+        { name: "cw@EOL", initial: "foo\nbar", keys: ["$", "c", "w"] },
+        { name: "yw@EOL", initial: "foo\nbar", keys: ["$", "y", "w"] },
+        { name: "db@BOL", initial: "foo\nbar", keys: ["j", "0", "d", "b"] },
+        { name: "cb@BOL", initial: "foo\nbar", keys: ["j", "0", "c", "b"] },
+        { name: "yb@BOL", initial: "foo\nbar", keys: ["j", "0", "y", "b"] },
+        { name: "dW@EOL", initial: "foo\nbar", keys: ["$", "d", "W"] },
+        { name: "cW@EOL", initial: "foo\nbar", keys: ["$", "c", "W"] },
+        { name: "yW@EOL", initial: "foo\nbar", keys: ["$", "y", "W"] },
+        { name: "dE@EOL", initial: "foo\nbar", keys: ["$", "d", "E"] },
+        { name: "cE@EOL", initial: "foo\nbar", keys: ["$", "c", "E"] },
+        { name: "yE@EOL", initial: "foo\nbar", keys: ["$", "y", "E"] },
+        { name: "dB@BOL", initial: "foo\nbar", keys: ["j", "0", "d", "B"] },
+        { name: "cB@BOL", initial: "foo\nbar", keys: ["j", "0", "c", "B"] },
+        { name: "yB@BOL", initial: "foo\nbar", keys: ["j", "0", "y", "B"] },
+      ];
+
+    for (const scenario of scenarios) {
+      const { editor } = createMultiLineEditor(scenario.initial);
+      const raw = getRawEditor(editor);
+      const original = raw.findWordTargetInText.bind(raw);
+      let calls = 0;
+
+      raw.findWordTargetInText = (...args: FindWordTargetInTextArgs) => {
+        calls++;
+        return original(...args);
+      };
+
+      sendKeys(editor, scenario.keys);
+      assert.ok(calls > 0, `${scenario.name} should fall back`);
+    }
+  });
+});
+
+describe("word-motion fast path differential", () => {
+  const assertFastEqualsCanonical = (
+    initial: string,
+    keys: string[],
+    label: string,
+  ): void => {
+    const fast = runScenario(initial, keys, "fast");
+    const canonical = runScenario(initial, keys, "canonical");
+    assert.deepEqual(fast, canonical, label);
+  };
+
+  it("matches canonical behavior on generated line fixtures", () => {
+    const fixtures = makeGeneratedLineFixtures(80);
+    const scenarios: Array<{ name: string; keys: string[] }> = [
+      { name: "w+x", keys: ["w", "x"] },
+      { name: "e+x", keys: ["e", "x"] },
+      { name: "w,b,x", keys: ["w", "b", "x"] },
+      { name: "dw", keys: ["d", "w"] },
+      { name: "de", keys: ["d", "e"] },
+      { name: "w,db", keys: ["w", "d", "b"] },
+      { name: "cw", keys: ["c", "w"] },
+      { name: "ce", keys: ["c", "e"] },
+      { name: "w,cb", keys: ["w", "c", "b"] },
+      { name: "yw", keys: ["y", "w"] },
+      { name: "ye", keys: ["y", "e"] },
+      { name: "w,yb", keys: ["w", "y", "b"] },
+      { name: "W+x", keys: ["W", "x"] },
+      { name: "E+x", keys: ["E", "x"] },
+      { name: "W,B,x", keys: ["W", "B", "x"] },
+      { name: "2W+x", keys: ["2", "W", "x"] },
+      { name: "2E+x", keys: ["2", "E", "x"] },
+      { name: "dW", keys: ["d", "W"] },
+      { name: "dE", keys: ["d", "E"] },
+      { name: "W,dB", keys: ["W", "d", "B"] },
+      { name: "d2W", keys: ["d", "2", "W"] },
+      { name: "2dW", keys: ["2", "d", "W"] },
+      { name: "cW", keys: ["c", "W"] },
+      { name: "cE", keys: ["c", "E"] },
+      { name: "W,cB", keys: ["W", "c", "B"] },
+      { name: "c2E", keys: ["c", "2", "E"] },
+      { name: "yW", keys: ["y", "W"] },
+      { name: "yE", keys: ["y", "E"] },
+      { name: "W,yB", keys: ["W", "y", "B"] },
+      { name: "y2W(cancel)", keys: ["y", "2", "W", "x"] },
+    ];
+
+    for (const line of fixtures) {
+      for (const scenario of scenarios) {
+        assertFastEqualsCanonical(
+          line,
+          scenario.keys,
+          `line=${JSON.stringify(line)} scenario=${scenario.name}`,
+        );
+      }
+    }
+  });
+
+  it("matches canonical behavior on cross-line uppercase WORD scenarios", () => {
+    const scenarios: Array<{ name: string; initial: string; keys: string[] }> =
+      [
+        { name: "W@EOL", initial: "foo\nbar", keys: ["$", "W", "x"] },
+        { name: "2W@EOL", initial: "foo\nbar baz", keys: ["$", "2", "W", "x"] },
+        { name: "E@EOL", initial: "foo\nbar", keys: ["$", "E", "x"] },
+        { name: "2E@EOL", initial: "foo\nbar baz", keys: ["$", "2", "E", "x"] },
+        { name: "B@BOL", initial: "foo\nbar", keys: ["j", "0", "B", "x"] },
+        {
+          name: "2B@BOL",
+          initial: "foo bar\nbaz",
+          keys: ["j", "0", "2", "B", "x"],
+        },
+        { name: "dW@EOL", initial: "foo\nbar", keys: ["$", "d", "W"] },
+        {
+          name: "cW@EOL",
+          initial: "foo\nbar",
+          keys: ["$", "c", "W", "X", "\x1b"],
+        },
+        { name: "yW@EOL", initial: "foo\nbar", keys: ["$", "y", "W", "p"] },
+        { name: "dE@EOL", initial: "foo\nbar", keys: ["$", "d", "E"] },
+        {
+          name: "cE@EOL",
+          initial: "foo\nbar",
+          keys: ["$", "c", "E", "X", "\x1b"],
+        },
+        { name: "yE@EOL", initial: "foo\nbar", keys: ["$", "y", "E", "p"] },
+        { name: "dB@BOL", initial: "foo\nbar", keys: ["j", "0", "d", "B"] },
+        {
+          name: "cB@BOL",
+          initial: "foo\nbar",
+          keys: ["j", "0", "c", "B", "X", "\x1b"],
+        },
+        {
+          name: "yB@BOL",
+          initial: "foo\nbar",
+          keys: ["j", "0", "y", "B", "p"],
+        },
+      ];
+
+    for (const scenario of scenarios) {
+      assertFastEqualsCanonical(scenario.initial, scenario.keys, scenario.name);
+    }
+  });
+});
+
+describe("word-motion guard boundary regressions", () => {
+  const assertFastEqualsCanonical = (
+    initial: string,
+    keys: string[],
+    label: string,
+  ): void => {
+    const fast = runScenario(initial, keys, "fast");
+    const canonical = runScenario(initial, keys, "canonical");
+    assert.deepEqual(fast, canonical, label);
+  };
+
+  it("matches canonical behavior at EOL/BOL + punctuation/whitespace/empty boundaries", () => {
+    const cases: Array<{ label: string; initial: string; keys: string[] }> = [
+      {
+        label: "EOL cross-line dw",
+        initial: "foo\nbar",
+        keys: ["$", "d", "w"],
+      },
+      {
+        label: "BOL cross-line yb",
+        initial: "foo\nbar",
+        keys: ["j", "0", "y", "b"],
+      },
+      {
+        label: "EOL cross-line dW",
+        initial: "foo\nbar",
+        keys: ["$", "d", "W"],
+      },
+      {
+        label: "EOL cross-line yE",
+        initial: "foo\nbar",
+        keys: ["$", "y", "E", "p"],
+      },
+      {
+        label: "BOL cross-line cB",
+        initial: "foo\nbar",
+        keys: ["j", "0", "c", "B", "X", "\x1b"],
+      },
+      {
+        label: "punctuation run (word)",
+        initial: "foo---bar",
+        keys: ["w", "x"],
+      },
+      {
+        label: "punctuation run (WORD)",
+        initial: "foo---bar",
+        keys: ["W", "x"],
+      },
+      {
+        label: "whitespace run (word)",
+        initial: "foo     bar",
+        keys: ["w", "x"],
+      },
+      {
+        label: "whitespace run (WORD)",
+        initial: "foo     bar",
+        keys: ["W", "x"],
+      },
+      { label: "empty line (word)", initial: "", keys: ["w", "d", "w"] },
+      { label: "empty line (WORD)", initial: "", keys: ["W", "d", "W"] },
+      {
+        label: "blank-middle-line W",
+        initial: "foo\n\nbar",
+        keys: ["$", "W", "x"],
+      },
+      {
+        label: "blank-middle-line B",
+        initial: "foo\n\nbar",
+        keys: ["j", "j", "0", "B", "x"],
+      },
+      {
+        label: "WORD punctuation + whitespace boundary",
+        initial: "foo--bar   baz",
+        keys: ["W", "E", "x"],
+      },
+    ];
+
+    for (const testCase of cases) {
+      assertFastEqualsCanonical(
+        testCase.initial,
+        testCase.keys,
+        testCase.label,
+      );
+    }
+  });
+
+  it("keeps insert-mode behavior unaffected", () => {
+    assertFastEqualsCanonical(
+      "hello",
+      ["i", "X", "Y", "\x1b", "x"],
+      "insert mode",
+    );
+  });
+
+  it("keeps non-word command behavior unaffected", () => {
+    assertFastEqualsCanonical(
+      "foo",
+      ["x", "P", "f", "o", "x"],
+      "non-word commands",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-line word motions (w / e / b and operator forms)
+// ---------------------------------------------------------------------------
+
+describe("cross-line word motions", () => {
+  it("w crosses EOL to next line word start", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+    sendKeys(editor, ["$", "w", "x"]);
+    // After w from EOL of line 1, cursor lands on 'b' of next line.
+    assert.equal(editor.getText(), "foo\nar");
+    assert.equal(editor.getRegister(), "b");
+  });
+
+  it("b at BOL jumps to previous line word start", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+    sendKeys(editor, ["j", "0", "b", "x"]);
+    assert.equal(editor.getText(), "oo\nbar");
+    assert.equal(editor.getRegister(), "f");
+  });
+
+  it("e crosses EOL to end of next line word", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+    sendKeys(editor, ["$", "e", "x"]);
+    assert.equal(editor.getText(), "foo\nba");
+    assert.equal(editor.getRegister(), "r");
+  });
+
+  it("dw can delete across newline", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+    sendKeys(editor, ["d", "w"]);
+    assert.equal(editor.getText(), "bar");
+    assert.equal(editor.getRegister(), "foo\n");
+  });
+
+  it("yw can yank across newline without mutation", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+    const before = editor.getText();
+    sendKeys(editor, ["y", "w"]);
+    assert.equal(editor.getRegister(), "foo\n");
+    assert.equal(editor.getText(), before);
+  });
+
+  it("W crosses EOL to next line WORD start", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+    sendKeys(editor, ["$", "W", "x"]);
+    assert.equal(editor.getText(), "foo\nar");
+    assert.equal(editor.getRegister(), "b");
+  });
+
+  it("B at BOL jumps to previous line WORD start", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+    sendKeys(editor, ["j", "0", "B", "x"]);
+    assert.equal(editor.getText(), "oo\nbar");
+    assert.equal(editor.getRegister(), "f");
+  });
+
+  it("E crosses EOL to end of next line WORD", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+    sendKeys(editor, ["$", "E", "x"]);
+    assert.equal(editor.getText(), "foo\nba");
+    assert.equal(editor.getRegister(), "r");
+  });
+
+  it("dW crosses newline while cW keeps cE parity", () => {
+    const { editor: deleteEditor } = createMultiLineEditor("foo\nbar");
+    sendKeys(deleteEditor, ["d", "W"]);
+    assert.equal(deleteEditor.getText(), "bar");
+    assert.equal(deleteEditor.getRegister(), "foo\n");
+
+    const { editor: changeEditor } = createMultiLineEditor("foo\nbar");
+    sendKeys(changeEditor, ["c", "W"]);
+    assert.equal(changeEditor.getText(), "\nbar");
+    assert.equal(changeEditor.getRegister(), "foo");
+    assert.equal(changeEditor.getMode(), "insert");
+  });
+
+  it("yW can yank across newline without mutation", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+    const before = editor.getText();
+    sendKeys(editor, ["y", "W"]);
+    assert.equal(editor.getRegister(), "foo\n");
+    assert.equal(editor.getText(), before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Yank (y) — no mutation, writes register
+// ---------------------------------------------------------------------------
+
+describe("yank operator — yy / yw / ye / yb / y$ / y0", () => {
+  it("yy: yanks line + newline, does not mutate text", () => {
+    const { editor } = createEditorWithSpy("hello world");
+    const before = editor.getText();
+    sendKeys(editor, ["y", "y"]);
+    assert.equal(editor.getRegister(), "hello world\n");
+    assert.equal(editor.getText(), before);
+  });
+
+  it("yw: yanks forward word, no mutation", () => {
+    const { editor } = createEditorWithSpy("hello world");
+    const before = editor.getText();
+    sendKeys(editor, ["y", "w"]);
+    assert.equal(editor.getRegister(), "hello ");
+    assert.equal(editor.getText(), before);
+  });
+
+  it("ye: yanks to end of word (inclusive), no mutation", () => {
+    const { editor } = createEditorWithSpy("hello world");
+    const before = editor.getText();
+    sendKeys(editor, ["y", "e"]);
+    assert.equal(editor.getRegister(), "hello");
+    assert.equal(editor.getText(), before);
+  });
+
+  it("yb from mid-word: yanks backward, no mutation", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+    const before = editor.getText();
+    sendKeys(editor, ["w", "y", "b"]); // navigate to 'b', yank back to 'f'
+    assert.equal(editor.getRegister(), "foo ");
+    assert.equal(editor.getText(), before);
+  });
+
+  it("y$: yanks to EOL, no mutation", () => {
+    const { editor } = createEditorWithSpy("hello world");
+    const before = editor.getText();
+    sendKeys(editor, ["y", "$"]);
+    assert.equal(editor.getRegister(), "hello world");
+    assert.equal(editor.getText(), before);
+  });
+
+  it("y0 from mid-word: yanks to start, no mutation", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+    const before = editor.getText();
+    sendKeys(editor, ["w", "y", "0"]); // navigate to col 4, yank to start
+    assert.equal(editor.getRegister(), "foo ");
+    assert.equal(editor.getText(), before);
+  });
+
+  it("yW yanks to next WORD start without mutation", () => {
+    const { editor } = createEditorWithSpy("foo-bar   baz");
+    const before = editor.getText();
+
+    sendKeys(editor, ["y", "W"]);
+
+    assert.equal(editor.getRegister(), "foo-bar   ");
+    assert.equal(editor.getText(), before);
+  });
+
+  it("yE yanks to end of WORD inclusively", () => {
+    const { editor } = createEditorWithSpy("foo-bar   baz");
+    const before = editor.getText();
+
+    sendKeys(editor, ["y", "E"]);
+
+    assert.equal(editor.getRegister(), "foo-bar");
+    assert.equal(editor.getText(), before);
+  });
+
+  it("yB yanks backward by WORD", () => {
+    const { editor } = createEditorWithSpy("foo-bar baz");
+    const before = editor.getText();
+
+    sendKeys(editor, ["W", "y", "B"]);
+
+    assert.equal(editor.getRegister(), "foo-bar ");
+    assert.equal(editor.getText(), before);
+  });
+
+  it("yank invariant: text unchanged across all yank motions", () => {
+    const { editor } = createEditorWithSpy("hello world");
+    const before = editor.getText();
+    for (const motion of ["y", "w", "y", "e", "y", "$", "y", "b", "y", "0"]) {
+      sendKeys(editor, [motion]);
+    }
+    assert.equal(editor.getText(), before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Put (p / P) — character-wise
+// ---------------------------------------------------------------------------
+
+describe("put — character-wise", () => {
+  it("P uses the internal register while a local clipboard mirror is pending", async () => {
+    const { editor } = createEditorWithSpy("foo bar");
+    const activeWrite = deferred();
+    const writes: string[] = [];
+
+    editor.setClipboardFn(async (text) => {
+      writes.push(text);
+      await activeWrite.promise;
+    });
+    editor.setClipboardReadFn(() => "OLD");
+
+    try {
+      sendKeys(editor, ["d", "w", "P"]);
+
+      assert.equal(editor.getText(), "foo bar");
+      assert.equal(editor.getRegister(), "foo ");
+      assert.deepEqual(writes, ["foo "]);
+    } finally {
+      activeWrite.resolve();
+      await nextImmediate();
+    }
+  });
+
+  it("P reads the OS clipboard again after a local mirror settles", async () => {
+    const { editor } = createEditorWithSpy("foo bar");
+    const writes: string[] = [];
+
+    editor.setClipboardFn((text) => {
+      writes.push(text);
+    });
+    editor.setClipboardReadFn(() => "OLD");
+
+    sendKeys(editor, ["d", "w"]);
+    await nextImmediate();
+
+    editor.setClipboardReadFn(() => "SYS");
+    sendKeys(editor, ["P"]);
+
+    assert.equal(editor.getText(), "SYSbar");
+    assert.equal(editor.getRegister(), "foo ");
+    assert.deepEqual(writes, ["foo "]);
+  });
+
+  it("p reads OS clipboard text instead of stale internal register", () => {
+    const { editor } = createEditorWithSpy("ab");
+    editor.setRegister("shadow");
+    editor.setClipboardReadFn(() => "SYS");
+
+    sendKeys(editor, ["p"]);
+
+    assert.equal(editor.getText(), "aSYSb");
+    assert.equal(editor.getRegister(), "shadow");
+    assert.equal(editor.getMode(), "normal");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 4 });
+  });
+
+  it("P reads OS clipboard text instead of stale internal register", () => {
+    const { editor } = createEditorWithSpy("ab");
+    editor.setRegister("shadow");
+    editor.setClipboardReadFn(() => "SYS");
+
+    sendKeys(editor, ["P"]);
+
+    assert.equal(editor.getText(), "SYSab");
+    assert.equal(editor.getRegister(), "shadow");
+    assert.equal(editor.getMode(), "normal");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 3 });
+  });
+
+  it("p falls back to internal register when OS clipboard read returns null", () => {
+    const { editor } = createEditorWithSpy("ab");
+    editor.setRegister("shadow");
+    editor.setClipboardReadFn(() => null);
+
+    sendKeys(editor, ["p"]);
+
+    assert.equal(editor.getText(), "ashadowb");
+    assert.equal(editor.getRegister(), "shadow");
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("p falls back to internal register when OS clipboard read throws", () => {
+    const { editor } = createEditorWithSpy("ab");
+    editor.setRegister("shadow");
+    editor.setClipboardReadFn(() => {
+      throw new Error("clipboard read failed");
+    });
+
+    sendKeys(editor, ["p"]);
+
+    assert.equal(editor.getText(), "ashadowb");
+    assert.equal(editor.getRegister(), "shadow");
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("p treats empty OS clipboard as successful empty paste", () => {
+    const { editor } = createEditorWithSpy("ab");
+    editor.setRegister("shadow");
+    editor.setClipboardReadFn(() => "");
+
+    sendKeys(editor, ["p"]);
+
+    assert.equal(editor.getText(), "ab");
+    assert.equal(editor.getRegister(), "shadow");
+    assert.equal(editor.getMode(), "normal");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+  });
+
+  it("counted empty OS clipboard paste consumes the count", () => {
+    const { editor } = createEditorWithSpy("abcd");
+    editor.setRegister("shadow");
+    editor.setClipboardReadFn(() => "");
+
+    sendKeys(editor, ["3", "p", "l"]);
+
+    assert.equal(editor.getText(), "abcd");
+    assert.equal(editor.getRegister(), "shadow");
+    assert.equal(editor.getMode(), "normal");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 1 });
+  });
+
+  it("3p repeats OS clipboard text instead of stale internal register", () => {
+    const { editor } = createEditorWithSpy("X");
+    editor.setRegister("shadow");
+    editor.setClipboardReadFn(() => "ab");
+
+    sendKeys(editor, ["3", "p"]);
+
+    assert.equal(editor.getText(), "Xababab");
+    assert.equal(editor.getRegister(), "shadow");
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("3P repeats OS clipboard text instead of stale internal register", () => {
+    const { editor } = createEditorWithSpy("X");
+    editor.setRegister("shadow");
+    editor.setClipboardReadFn(() => "ab");
+
+    sendKeys(editor, ["3", "P"]);
+
+    assert.equal(editor.getText(), "abababX");
+    assert.equal(editor.getRegister(), "shadow");
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("p inserts register content after cursor", () => {
+    const { editor } = createEditorWithSpy("ab");
+    editor.setRegister("X");
+    sendKeys(editor, ["p"]);
+    assert.equal(editor.getText(), "aXb");
+  });
+
+  it("P inserts register content before cursor", () => {
+    const { editor } = createEditorWithSpy("ab");
+    editor.setRegister("X");
+    sendKeys(editor, ["P"]);
+    assert.equal(editor.getText(), "Xab");
+  });
+
+  it("p/P are no-ops when register is empty", () => {
+    const { editor } = createEditorWithSpy("ab");
+    editor.setRegister("");
+    const before = editor.getText();
+    sendKeys(editor, ["p"]);
+    assert.equal(editor.getText(), before);
+    sendKeys(editor, ["P"]);
+    assert.equal(editor.getText(), before);
+  });
+
+  it("yw then p: yanked text inserted after cursor", () => {
+    // "hello" col 0: yw grabs "hello" (whole word to EOL)
+    // p: ESC_RIGHT (col→1) then insert "hello" → "hhelloello"
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["y", "w"]);
+    assert.equal(editor.getRegister(), "hello");
+    sendKeys(editor, ["p"]);
+    assert.equal(editor.getText(), "hhelloello");
+  });
+
+  it("p at EOL on non-last line inserts before newline", () => {
+    const { editor } = createMultiLineEditor("foo\nbar");
+    editor.setRegister("X");
+    sendKeys(editor, ["$", "p"]);
+    assert.equal(editor.getText(), "fooX\nbar");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Put (p / P) — line-wise
+// ---------------------------------------------------------------------------
+
+describe("put — line-wise", () => {
+  it("p treats OS clipboard text ending in newline as linewise", () => {
+    const { editor } = createMultiLineEditor("a\nb");
+    editor.setRegister("shadow");
+    editor.setClipboardReadFn(() => "X\n");
+
+    sendKeys(editor, ["p"]);
+
+    assert.equal(editor.getText(), "a\nX\nb");
+    assert.equal(editor.getRegister(), "shadow");
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("P treats OS clipboard text ending in newline as linewise", () => {
+    const { editor } = createMultiLineEditor("a\nb");
+    editor.setRegister("shadow");
+    editor.setClipboardReadFn(() => "X\n");
+
+    sendKeys(editor, ["P"]);
+
+    assert.equal(editor.getText(), "X\na\nb");
+    assert.equal(editor.getRegister(), "shadow");
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("p with line-wise register inserts new line below", () => {
+    const { editor } = createEditorWithSpy("bar");
+    editor.setRegister("foo\n");
+    sendKeys(editor, ["p"]);
+    const lines = editor.getText().split("\n");
+    assert.equal(lines[0], "bar");
+    assert.equal(lines[1], "foo");
+  });
+
+  it("P with line-wise register inserts new line above", () => {
+    const { editor } = createEditorWithSpy("bar");
+    editor.setRegister("foo\n");
+    sendKeys(editor, ["P"]);
+    const lines = editor.getText().split("\n");
+    assert.equal(lines[0], "foo");
+    assert.equal(lines[1], "bar");
+  });
+
+  it("Y yanks current line (like yy)", () => {
+    const { editor } = createMultiLineEditor("aaa\nbbb\nccc");
+    sendKeys(editor, ["j", "Y", "p"]);
+    const lines = editor.getText().split("\n");
+    assert.deepStrictEqual(lines, ["aaa", "bbb", "bbb", "ccc"]);
+  });
+
+  it("3Y yanks 3 lines", () => {
+    const { editor } = createMultiLineEditor("aaa\nbbb\nccc\nddd");
+    sendKeys(editor, ["3", "Y", "G", "p"]);
+    const lines = editor.getText().split("\n");
+    assert.deepStrictEqual(lines, [
+      "aaa",
+      "bbb",
+      "ccc",
+      "ddd",
+      "aaa",
+      "bbb",
+      "ccc",
+    ]);
+  });
+
+  it("yy then p: duplicates line below", () => {
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["y", "y"]);
+    assert.equal(editor.getRegister(), "hello\n");
+    sendKeys(editor, ["p"]);
+    const lines = editor.getText().split("\n");
+    assert.equal(lines[0], "hello");
+    assert.equal(lines[1], "hello");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Undo / redo — u / ctrl+r  (Task 6)
+// ---------------------------------------------------------------------------
+
+describe("undo / redo — u / ctrl+r", () => {
+  it("u in normal mode does not insert the letter 'u'", () => {
+    // u must not be treated as a printable char — it must forward ctrl+_ to super
+    const { editor } = createEditorWithSpy("hello");
+    const before = editor.getText();
+    sendKeys(editor, ["u"]);
+    assert.ok(
+      !editor.getText().includes("uhello") &&
+        editor.getText().length <= before.length,
+      "u must not be inserted as a literal character and text must not grow",
+    );
+  });
+
+  it("u after dw: text does not grow (undo forwarded to underlying editor)", () => {
+    // Keep this as a narrow safety regression. Round-trip restore coverage
+    // lives in the redo-focused tests below.
+    const { editor } = createEditorWithSpy("hello world");
+    sendKeys(editor, ["d", "w"]);
+    const afterDelete = editor.getText();
+    assert.equal(afterDelete, "world");
+    sendKeys(editor, ["u"]); // sends \x1f to underlying editor
+    // text length must not grow beyond the pre-delete length
+    assert.ok(
+      editor.getText().length <= "hello world".length,
+      "undo must not corrupt state",
+    );
+  });
+
+  it("ctrl+r in normal mode with no redo history is a safe no-op", () => {
+    const { editor } = createEditorWithSpy("hello world");
+    const beforeText = editor.getText();
+    const beforeCursor = editor.getCursor();
+
+    assert.doesNotThrow(() => sendKeys(editor, ["\x12"]));
+    assert.equal(editor.getText(), beforeText);
+    assert.deepEqual(editor.getCursor(), beforeCursor);
+  });
+
+  it("ctrl+r after x then u restores deleted text", () => {
+    const { editor } = createEditorWithSpy("hello");
+
+    sendKeys(editor, ["x"]);
+    assert.equal(editor.getText(), "ello");
+
+    sendKeys(editor, ["u"]);
+    assert.equal(editor.getText(), "hello");
+
+    sendKeys(editor, ["\x12"]);
+    assert.equal(editor.getText(), "ello");
+  });
+
+  it("ctrl+r restores the captured post-change cursor", () => {
+    const { editor } = createEditorWithSpy("X");
+    editor.setRegister("ab");
+
+    sendKeys(editor, ["p"]);
+    const afterPutCursor = editor.getCursor();
+    assert.equal(editor.getText(), "Xab");
+    assert.deepEqual(afterPutCursor, { line: 0, col: 3 });
+
+    sendKeys(editor, ["u"]);
+    assert.equal(editor.getText(), "X");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 1 });
+
+    sendKeys(editor, ["\x12"]);
+    assert.equal(editor.getText(), "Xab");
+    assert.deepEqual(editor.getCursor(), afterPutCursor);
+  });
+
+  it("ctrl+r in normal mode is not inserted as a literal control character", () => {
+    const { editor } = createEditorWithSpy("hello");
+
+    sendKeys(editor, ["x", "u", "\x12"]);
+
+    assert.equal(editor.getText(), "ello");
+    assert.ok(
+      !editor.getText().includes("\x12"),
+      "ctrl+r must not become a literal control character in the buffer",
+    );
+  });
+
+  it("repeated ctrl+r walks forward through stacked redo history", () => {
+    const { editor } = createEditorWithSpy("abcd");
+
+    sendKeys(editor, ["x", "x", "x"]);
+    assert.equal(editor.getText(), "d");
+
+    sendKeys(editor, ["u", "u", "u"]);
+    assert.equal(editor.getText(), "abcd");
+
+    sendKeys(editor, ["\x12"]);
+    assert.equal(editor.getText(), "bcd");
+
+    sendKeys(editor, ["\x12"]);
+    assert.equal(editor.getText(), "cd");
+
+    sendKeys(editor, ["\x12"]);
+    assert.equal(editor.getText(), "d");
+  });
+
+  it("2ctrl+r redoes two stacked undo steps", () => {
+    const { editor } = createEditorWithSpy("abcd");
+
+    sendKeys(editor, ["x", "x", "x"]);
+    sendKeys(editor, ["u", "u", "u"]);
+    assert.equal(editor.getText(), "abcd");
+
+    sendKeys(editor, ["2", "\x12"]);
+
+    assert.equal(editor.getText(), "cd");
+  });
+
+  it("3ctrl+r redoes three stacked undo steps", () => {
+    const { editor } = createEditorWithSpy("abcd");
+
+    sendKeys(editor, ["x", "x", "x"]);
+    sendKeys(editor, ["u", "u", "u"]);
+    assert.equal(editor.getText(), "abcd");
+
+    sendKeys(editor, ["3", "\x12"]);
+
+    assert.equal(editor.getText(), "d");
+  });
+
+  it("3ctrl+r clamps when fewer redo steps exist", () => {
+    const { editor } = createEditorWithSpy("abcd");
+
+    sendKeys(editor, ["x", "x"]);
+    sendKeys(editor, ["u", "u"]);
+    assert.equal(editor.getText(), "abcd");
+
+    sendKeys(editor, ["3", "\x12"]);
+
+    assert.equal(editor.getText(), "cd");
+  });
+
+  it("counted ctrl+r does not leak count into the next command", () => {
+    const { editor } = createEditorWithSpy("abcd");
+
+    sendKeys(editor, ["x", "x", "x"]);
+    sendKeys(editor, ["u", "u", "u"]);
+    assert.equal(editor.getText(), "abcd");
+
+    sendKeys(editor, ["2", "\x12", "x"]);
+
+    assert.equal(editor.getText(), "d");
+    assert.equal(editor.getRegister(), "c");
+  });
+
+  it("redo parity: x restores text, cursor, and register", () => {
+    assertRedoRoundTrip({
+      initial: "hello",
+      keys: ["x"],
+      expectedText: "ello",
+      expectedCursor: { line: 0, col: 0 },
+      expectedRegister: "h",
+    });
+  });
+
+  it("redo parity: dw restores text, cursor, and register", () => {
+    assertRedoRoundTrip({
+      initial: "hello world",
+      keys: ["d", "w"],
+      expectedText: "world",
+      expectedCursor: { line: 0, col: 0 },
+      expectedRegister: "hello ",
+    });
+  });
+
+  it("redo parity: dd restores text, cursor, and register", () => {
+    assertRedoRoundTrip({
+      initial: "foo\nbar",
+      keys: ["d", "d"],
+      expectedText: "bar",
+      expectedCursor: { line: 0, col: 0 },
+      expectedRegister: "foo\n",
+      multiLine: true,
+    });
+  });
+
+  it("redo parity: p restores text, cursor, and register", () => {
+    assertRedoRoundTrip({
+      initial: "ab",
+      keys: ["p"],
+      expectedText: "aXb",
+      expectedCursor: { line: 0, col: 2 },
+      expectedRegister: "X",
+      before: (editor) => editor.setRegister("X"),
+    });
+  });
+
+  it("redo parity: P restores text, cursor, and register", () => {
+    assertRedoRoundTrip({
+      initial: "ab",
+      keys: ["P"],
+      expectedText: "Xab",
+      expectedCursor: { line: 0, col: 1 },
+      expectedRegister: "X",
+      before: (editor) => editor.setRegister("X"),
+    });
+  });
+
+  it("redo parity: cw restores text, cursor, and register", () => {
+    assertRedoRoundTrip({
+      initial: "hello world",
+      keys: ["c", "w", "Z", "\x1b"],
+      expectedText: "Zworld",
+      expectedCursor: { line: 0, col: 1 },
+      expectedRegister: "hello ",
+    });
+  });
+
+  it("redo parity: J restores text, cursor, and register", () => {
+    assertRedoRoundTrip({
+      initial: "foo\nbar",
+      keys: ["J"],
+      expectedText: "foo bar",
+      expectedCursor: { line: 0, col: 3 },
+      expectedRegister: "",
+      multiLine: true,
+    });
+  });
+
+  it("redo parity: gJ restores text, cursor, and register", () => {
+    assertRedoRoundTrip({
+      initial: "foo\nbar",
+      keys: ["g", "J"],
+      expectedText: "foobar",
+      expectedCursor: { line: 0, col: 3 },
+      expectedRegister: "",
+      multiLine: true,
+    });
+  });
+
+  it("redo parity: 3J restores text, cursor, and register", () => {
+    assertRedoRoundTrip({
+      initial: "aa\nbb\ncc",
+      keys: ["3", "J"],
+      expectedText: "aa bb cc",
+      expectedCursor: { line: 0, col: 5 },
+      expectedRegister: "",
+      multiLine: true,
+    });
+  });
+
+  it("redo parity: 3gJ restores text, cursor, and register", () => {
+    assertRedoRoundTrip({
+      initial: "aa\nbb\ncc",
+      keys: ["3", "g", "J"],
+      expectedText: "aabbcc",
+      expectedCursor: { line: 0, col: 4 },
+      expectedRegister: "",
+      multiLine: true,
+    });
+  });
+
+  it("redo parity: J preserves preexisting unnamed register", () => {
+    assertRedoRoundTrip({
+      initial: "foo\nbar",
+      keys: ["J"],
+      expectedText: "foo bar",
+      expectedCursor: { line: 0, col: 3 },
+      expectedRegister: "keep",
+      multiLine: true,
+      before: (editor) => editor.setRegister("keep"),
+    });
+  });
+
+  describe("central invalidation hook", () => {
+    function seedStaleRedo(options: { initial: string; multiLine?: boolean }): {
+      editor: ReturnType<typeof createEditorWithSpy>["editor"];
+      staleRedoText: string;
+    } {
+      const { initial, multiLine = false } = options;
+      const { editor } = multiLine
+        ? createMultiLineEditor(initial)
+        : createEditorWithSpy(initial);
+
+      sendKeys(editor, ["x"]);
+      const staleRedoText = editor.getText();
+      sendKeys(editor, ["u"]);
+      assert.equal(
+        editor.getText(),
+        initial,
+        "redo setup should restore initial text",
+      );
+
+      return { editor, staleRedoText };
+    }
+
+    it("mutation classes clear redo history", () => {
+      const scenarios: Array<{
+        name: string;
+        initial: string;
+        keys: string[];
+        expectedText: string;
+        multiLine?: boolean;
+      }> = [
+        {
+          name: "insert-mode text entry",
+          initial: "abcd",
+          keys: ["i", "Z", "\x1b"],
+          expectedText: "Zabcd",
+        },
+        {
+          name: "delegated normal-mode mutation (D)",
+          initial: "abcd",
+          keys: ["D"],
+          expectedText: "",
+        },
+        {
+          name: "delegated normal-mode mutation (dw)",
+          initial: "alpha beta",
+          keys: ["d", "w"],
+          expectedText: "beta",
+        },
+        {
+          name: "synthetic edit (J)",
+          initial: "a\nb",
+          keys: ["J"],
+          expectedText: "a b",
+          multiLine: true,
+        },
+        {
+          name: "synthetic edit (gJ)",
+          initial: "a\nb",
+          keys: ["g", "J"],
+          expectedText: "ab",
+          multiLine: true,
+        },
+      ];
+
+      for (const scenario of scenarios) {
+        const { editor } = seedStaleRedo({
+          initial: scenario.initial,
+          multiLine: scenario.multiLine,
+        });
+
+        sendKeys(editor, scenario.keys);
+        assert.equal(
+          editor.getText(),
+          scenario.expectedText,
+          `${scenario.name} mutates text`,
+        );
+
+        sendKeys(editor, ["\x12"]);
+        assert.equal(
+          editor.getText(),
+          scenario.expectedText,
+          `${scenario.name} clears redo`,
+        );
+      }
+    });
+
+    it("guarded undo/redo classes preserve redo history", () => {
+      const scenarios: Array<{
+        name: string;
+        run: (editor: ReturnType<typeof createEditorWithSpy>["editor"]) => void;
+      }> = [
+        {
+          name: "undo transition",
+          run: (editor) => {
+            sendKeys(editor, ["x", "x"]);
+            sendKeys(editor, ["u"]);
+            assert.equal(editor.getText(), "bcd", "undo transition checkpoint");
+
+            sendKeys(editor, ["u"]);
+            assert.equal(
+              editor.getText(),
+              "abcd",
+              "undo transition keeps redo stack",
+            );
+
+            sendKeys(editor, ["\x12", "\x12"]);
+            assert.equal(
+              editor.getText(),
+              "cd",
+              "undo transition keeps both redo entries",
+            );
+          },
+        },
+        {
+          name: "redo transition",
+          run: (editor) => {
+            sendKeys(editor, ["x", "x", "x"]);
+            sendKeys(editor, ["u", "u", "u"]);
+            assert.equal(editor.getText(), "abcd", "redo transition setup");
+
+            sendKeys(editor, ["2", "\x12"]);
+            assert.equal(
+              editor.getText(),
+              "cd",
+              "redo transition keeps stepwise redo",
+            );
+
+            sendKeys(editor, ["u"]);
+            assert.equal(
+              editor.getText(),
+              "bcd",
+              "redo transition keeps undo boundaries",
+            );
+          },
+        },
+      ];
+
+      for (const scenario of scenarios) {
+        const { editor } = createEditorWithSpy("abcd");
+        scenario.run(editor);
+      }
+    });
+
+    it("non-mutating classes preserve redo history", () => {
+      const scenarios: Array<{
+        name: string;
+        run: (
+          editor: ReturnType<typeof createEditorWithSpy>["editor"],
+          staleRedoText: string,
+        ) => void;
+      }> = [
+        {
+          name: "navigation",
+          run: (editor, staleRedoText) => {
+            sendKeys(editor, ["l", "h", "\x12"]);
+            assert.equal(
+              editor.getText(),
+              staleRedoText,
+              "navigation preserves redo",
+            );
+          },
+        },
+        {
+          name: "yank",
+          run: (editor, staleRedoText) => {
+            sendKeys(editor, ["y", "y", "\x12"]);
+            assert.equal(
+              editor.getText(),
+              staleRedoText,
+              "yank preserves redo",
+            );
+          },
+        },
+        {
+          name: "failed motion",
+          run: (editor, staleRedoText) => {
+            sendKeys(editor, ["f", "z", "\x12"]);
+            assert.equal(
+              editor.getText(),
+              staleRedoText,
+              "failed motion preserves redo",
+            );
+          },
+        },
+        {
+          name: "mode toggle",
+          run: (editor, staleRedoText) => {
+            sendKeys(editor, ["i", "\x1b", "\x12"]);
+            assert.equal(
+              editor.getText(),
+              staleRedoText,
+              "mode toggle preserves redo",
+            );
+          },
+        },
+        {
+          name: "no-op redo",
+          run: (editor, staleRedoText) => {
+            sendKeys(editor, ["\x12"]);
+            assert.equal(
+              editor.getText(),
+              staleRedoText,
+              "redo setup should replay once",
+            );
+
+            sendKeys(editor, ["\x12"]);
+            assert.equal(
+              editor.getText(),
+              staleRedoText,
+              "no-op redo does not mutate",
+            );
+
+            sendKeys(editor, ["u", "\x12"]);
+            assert.equal(
+              editor.getText(),
+              staleRedoText,
+              "no-op redo keeps history intact",
+            );
+          },
+        },
+      ];
+
+      for (const scenario of scenarios) {
+        const { editor, staleRedoText } = seedStaleRedo({ initial: "abcd" });
+        scenario.run(editor, staleRedoText);
+      }
+    });
+
+    it("empty redo-stack fast path is harmless", () => {
+      const { editor } = createEditorWithSpy("abcd");
+
+      sendKeys(editor, ["\x12"]);
+      assert.equal(editor.getText(), "abcd");
+
+      sendKeys(editor, ["i", "Z", "\x1b"]);
+      assert.equal(editor.getText(), "Zabcd");
+
+      sendKeys(editor, ["u", "\x12"]);
+      assert.equal(editor.getText(), "Zabcd");
+    });
+
+    it("no-op synthetic edit (J on last line) preserves redo", () => {
+      const { editor } = createEditorWithSpy("hello");
+      sendKeys(editor, ["x"]);
+      sendKeys(editor, ["u"]);
+      assert.equal(editor.getText(), "hello");
+      sendKeys(editor, ["J"]);
+      sendKeys(editor, ["\x12"]);
+      assert.equal(editor.getText(), "ello");
+    });
+  });
+
+  it("bracketed paste in normal mode still clears pending state before redo", () => {
+    const { editor } = createEditorWithSpy("abcd");
+
+    sendKeys(editor, ["x", "u"]);
+    assert.equal(editor.getText(), "abcd");
+
+    editor.setRegister("keep");
+    sendKeys(editor, ["d", "\x1b[200~paste\x1b[201~", "\x12"]);
+
+    assert.equal(editor.getText(), "bcd");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+    assert.equal(editor.getRegister(), "keep");
+  });
+
+  it("ctrl+k still cancels pending delete and clears stale redo history", () => {
+    const { editor } = createEditorWithSpy("abcd");
+
+    sendKeys(editor, ["x", "u"]);
+    assert.equal(editor.getText(), "abcd");
+    assert.equal(editor.getRegister(), "a");
+
+    sendKeys(editor, ["d", "\x0b"]);
+
+    assert.equal(editor.getText(), "");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+    assert.equal(editor.getRegister(), "a");
+
+    sendKeys(editor, ["\x12"]);
+    assert.equal(editor.getText(), "");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+    assert.equal(editor.getRegister(), "a");
+  });
+
+  it("redo does not stomp a newer unnamed register value", () => {
+    const { editor } = createEditorWithSpy("hello world");
+
+    sendKeys(editor, ["x", "u"]);
+    sendKeys(editor, ["y", "w"]);
+    assert.equal(editor.getRegister(), "hello ");
+
+    sendKeys(editor, ["\x12"]);
+
+    assert.equal(editor.getText(), "ello world");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+    assert.equal(editor.getRegister(), "hello ");
+  });
+
+  it("u in insert mode inserts literal 'u' (not intercepted)", () => {
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["i"]); // → insert mode
+    assert.equal(editor.getMode(), "insert");
+    sendKeys(editor, ["u"]);
+    assert.ok(
+      editor.getText().includes("u"),
+      "u in insert mode must insert character",
+    );
+  });
+
+  it("undo does not self-invalidate redo stack", () => {
+    const { editor } = createEditorWithSpy("abcd");
+    sendKeys(editor, ["x", "x"]); // 'a' then 'b' deleted
+    assert.equal(editor.getText(), "cd");
+    sendKeys(editor, ["u"]); // undo 'b' delete → "bcd"
+    // redo stack has 1 entry; second undo must not clear it
+    sendKeys(editor, ["u"]); // undo 'a' delete → "abcd"
+    assert.equal(editor.getText(), "abcd");
+    // both redo entries must survive
+    sendKeys(editor, ["\x12"]);
+    assert.equal(editor.getText(), "bcd");
+    sendKeys(editor, ["\x12"]);
+    assert.equal(editor.getText(), "cd");
+  });
+
+  describe("stepwise counted redo — intermediate undo granularity", () => {
+    it("2<C-r> then u lands on state after first redo", () => {
+      const { editor } = createEditorWithSpy("abcd");
+      sendKeys(editor, ["x", "x", "x"]); // "d"
+      sendKeys(editor, ["u", "u", "u"]); // "abcd"
+      sendKeys(editor, ["2", "\x12"]); // redo 2 steps → "cd"
+      assert.equal(editor.getText(), "cd");
+      sendKeys(editor, ["u"]); // undo one redo → "bcd"
+      assert.equal(editor.getText(), "bcd");
+    });
+
+    it("after 2<C-r> then u, another u returns to pre-redo state", () => {
+      const { editor } = createEditorWithSpy("abcd");
+      sendKeys(editor, ["x", "x", "x"]);
+      sendKeys(editor, ["u", "u", "u"]);
+      sendKeys(editor, ["2", "\x12"]);
+      sendKeys(editor, ["u"]); // → "bcd"
+      sendKeys(editor, ["u"]); // → "abcd"
+      assert.equal(editor.getText(), "abcd");
+    });
+
+    it("stepwise redo with synthetic-edit history (J)", () => {
+      const { editor } = createMultiLineEditor("a\nb\nc");
+      sendKeys(editor, ["J"]); // join → "a b\nc"
+      sendKeys(editor, ["J"]); // join → "a b c"
+      assert.equal(editor.getText(), "a b c");
+
+      sendKeys(editor, ["u", "u"]); // undo both → "a\nb\nc"
+      assert.equal(editor.getText(), "a\nb\nc");
+
+      sendKeys(editor, ["2", "\x12"]); // redo 2 → "a b c"
+      assert.equal(editor.getText(), "a b c");
+
+      sendKeys(editor, ["u"]); // undo last redo → "a b\nc"
+      assert.equal(editor.getText(), "a b\nc");
+    });
+  });
+
+  describe("redo restore hardening", () => {
+    it("restore failure does not consume redo entry or change visible state", () => {
+      const { editor } = createEditorWithSpy("abcd");
+      sendKeys(editor, ["x", "u"]);
+      assert.equal(editor.getText(), "abcd");
+
+      const raw = getRawEditor(editor);
+      const savedState = raw.state;
+      raw.state = undefined;
+
+      try {
+        assert.throws(
+          () => sendKeys(editor, ["\x12"]),
+          /redo restore prerequisite: editor state unavailable/i,
+        );
+      } finally {
+        raw.state = savedState;
+      }
+
+      assert.equal(editor.getText(), "abcd");
+
+      sendKeys(editor, ["\x12"]);
+      assert.equal(editor.getText(), "bcd");
+    });
+
+    it("partial counted redo failure preserves committed steps", () => {
+      const { editor } = createEditorWithSpy("abcd");
+      sendKeys(editor, ["x", "x"]); // "cd"
+      sendKeys(editor, ["u", "u"]); // "abcd"
+      assert.equal(editor.getText(), "abcd");
+
+      const raw = getRawEditor(editor);
+      const originalPushUndoSnapshot = raw.pushUndoSnapshot;
+      let pushCalls = 0;
+      let suspendedState = raw.state;
+
+      raw.pushUndoSnapshot = () => {
+        pushCalls++;
+        originalPushUndoSnapshot?.call(raw);
+        if (pushCalls === 2) {
+          suspendedState = raw.state;
+          raw.state = undefined;
+        }
+      };
+
+      try {
+        assert.throws(
+          () => sendKeys(editor, ["2", "\x12"]),
+          /redo restore prerequisite: editor state unavailable/i,
+        );
+      } finally {
+        raw.state = suspendedState;
+        raw.pushUndoSnapshot = originalPushUndoSnapshot;
+      }
+
+      assert.equal(editor.getText(), "bcd");
+
+      sendKeys(editor, ["\x12"]);
+      assert.equal(editor.getText(), "cd");
+    });
+
+    it("redo throws when pushUndoSnapshot is unavailable", () => {
+      const { editor } = createEditorWithSpy("abcd");
+      sendKeys(editor, ["x", "u"]);
+      assert.equal(editor.getText(), "abcd");
+
+      const raw = getRawEditor(editor);
+      const saved = raw.pushUndoSnapshot;
+      raw.pushUndoSnapshot = undefined;
+
+      try {
+        assert.throws(() => sendKeys(editor, ["\x12"]), /pushUndoSnapshot/i);
+      } finally {
+        raw.pushUndoSnapshot = saved;
+      }
+
+      // Redo entry must NOT have been consumed
+      sendKeys(editor, ["\x12"]);
+      assert.equal(editor.getText(), "bcd");
+    });
+  });
+
+  describe("post-redo motion/cache coherence", () => {
+    it("w motion after redo of join reads restored buffer", () => {
+      const { editor } = createMultiLineEditor("aaa\nbbb ccc");
+
+      sendKeys(editor, ["J"]);
+      assert.equal(editor.getText(), "aaa bbb ccc");
+
+      sendKeys(editor, ["u"]);
+      assert.equal(editor.getText(), "aaa\nbbb ccc");
+
+      sendKeys(editor, ["\x12"]);
+      assert.equal(editor.getText(), "aaa bbb ccc");
+
+      sendKeys(editor, ["w", "x"]);
+      assert.equal(editor.getText(), "aaa bb ccc");
+    });
+
+    it("b motion after redo reads restored buffer", () => {
+      const { editor } = createEditorWithSpy("hello world");
+
+      sendKeys(editor, ["x"]);
+      assert.equal(editor.getText(), "ello world");
+
+      sendKeys(editor, ["u"]);
+      assert.equal(editor.getText(), "hello world");
+
+      sendKeys(editor, ["\x12"]);
+      assert.equal(editor.getText(), "ello world");
+
+      sendKeys(editor, ["$", "b", "x"]);
+      assert.equal(editor.getText(), "ello orld");
+    });
+  });
+
+  describe("normal-mode CTRL_UNDERSCORE undo alias", () => {
+    it("CTRL_UNDERSCORE in normal mode acts as undo", () => {
+      const { editor } = createEditorWithSpy("abcd");
+      sendKeys(editor, ["x"]); // delete 'a'
+      assert.equal(editor.getText(), "bcd");
+      sendKeys(editor, ["\x1f"]); // CTRL_UNDERSCORE
+      assert.equal(editor.getText(), "abcd");
+    });
+
+    it("CTRL_UNDERSCORE feeds redo history like u", () => {
+      const { editor } = createEditorWithSpy("abcd");
+      sendKeys(editor, ["x"]);
+      sendKeys(editor, ["\x1f"]); // undo via CTRL_UNDERSCORE
+      assert.equal(editor.getText(), "abcd");
+      sendKeys(editor, ["\x12"]); // redo
+      assert.equal(editor.getText(), "bcd");
+    });
+
+    it("no-op CTRL_UNDERSCORE does not create redo history", () => {
+      const { editor } = createEditorWithSpy("abcd");
+      sendKeys(editor, ["\x1f"]); // undo with nothing to undo
+      sendKeys(editor, ["\x12"]); // redo should be no-op
+      assert.equal(editor.getText(), "abcd");
+    });
+
+    it("CTRL_UNDERSCORE does not insert literal control char", () => {
+      const { editor } = createEditorWithSpy("hello");
+      sendKeys(editor, ["\x1f"]);
+      assert.ok(
+        !editor.getText().includes("\x1f"),
+        "must not insert literal \\x1f",
+      );
+    });
+  });
+
+  describe("count-state safety for counted redo", () => {
+    it("{count}<C-r> does not leak count into next command (9)", () => {
+      const { editor } = createEditorWithSpy("abcdefghij");
+      sendKeys(editor, ["x", "u"]);
+      // 9<C-r> clamps to 1 available entry, then x deletes one char
+      sendKeys(editor, ["9", "\x12", "x"]);
+      assert.equal(editor.getText(), "cdefghij");
+      assert.equal(editor.getRegister(), "b");
+    });
+
+    it("0 after counted redo is treated as line-start motion", () => {
+      const { editor } = createEditorWithSpy("abcd");
+      sendKeys(editor, ["l", "l", "x", "u"]);
+      // 1<C-r> redoes the x at col 2 → "abd"; 0 = line-start; x deletes 'a'
+      sendKeys(editor, ["1", "\x12", "0", "x"]);
+      assert.equal(editor.getText(), "bd");
+    });
+  });
+  describe("counted undo", () => {
+    it("3u undoes 3 separate edits", () => {
+      const { editor } = createMultiLineEditor("hello");
+      // make 3 edits
+      sendKeys(editor, ["A"]);
+      sendKeys(editor, [" "]);
+      sendKeys(editor, ["\x1b"]);
+      sendKeys(editor, ["A"]);
+      sendKeys(editor, ["w"]);
+      sendKeys(editor, ["\x1b"]);
+      sendKeys(editor, ["A"]);
+      sendKeys(editor, ["!"]);
+      sendKeys(editor, ["\x1b"]);
+      // buffer should be "hello w!"
+      assert.equal(editor.getText(), "hello w!");
+      // 3u should undo all 3 edits
+      sendKeys(editor, ["3", "u"]);
+      assert.equal(editor.getText(), "hello");
+    });
+
+    it("counted undo clamps at available history", () => {
+      // Start with empty text so no setup undo history exists
+      const { editor } = createMultiLineEditor("");
+      // make 1 edit: type a char in insert mode
+      sendKeys(editor, ["i", "!", "\x1b"]);
+      assert.equal(editor.getText(), "!");
+      // 9u should undo the 1 available edit without error
+      sendKeys(editor, ["9", "u"]);
+      assert.equal(editor.getText(), "");
+    });
+
+    it("counted undo does not leak count to next command", () => {
+      const { editor } = createMultiLineEditor("aaa\nbbb\nccc");
+      // make 2 edits
+      sendKeys(editor, ["A"]);
+      sendKeys(editor, ["!"]);
+      sendKeys(editor, ["\x1b"]);
+      sendKeys(editor, ["j"]);
+      sendKeys(editor, ["A"]);
+      sendKeys(editor, ["?"]);
+      sendKeys(editor, ["\x1b"]);
+      // 2u
+      sendKeys(editor, ["2", "u"]);
+      // now press j — should move 1 line, not 2
+      sendKeys(editor, ["j"]);
+      // cursor should be on line 1 (0-indexed), not line 2
+      assert.strictEqual(editor.getCursor().line, 1);
+    });
+  });
+
+  describe("kitty keyboard protocol sequences", () => {
+    it("kitty ctrl+r triggers redo", () => {
+      const { editor } = createEditorWithSpy("abcd");
+      sendKeys(editor, ["x", "u"]);
+      assert.equal(editor.getText(), "abcd");
+      sendKeys(editor, ["\x1b[114;5u"]); // kitty ctrl+r
+      assert.equal(editor.getText(), "bcd");
+    });
+
+    it("kitty ctrl+_ triggers undo and feeds redo", () => {
+      const { editor } = createEditorWithSpy("abcd");
+      sendKeys(editor, ["x"]);
+      assert.equal(editor.getText(), "bcd");
+      sendKeys(editor, ["\x1b[95;5u"]); // kitty ctrl+_
+      assert.equal(editor.getText(), "abcd");
+      sendKeys(editor, ["\x12"]); // redo
+      assert.equal(editor.getText(), "bcd");
+    });
+
+    it("counted kitty ctrl+r works", () => {
+      const { editor } = createEditorWithSpy("abcd");
+      sendKeys(editor, ["x", "x"]);
+      assert.equal(editor.getText(), "cd");
+      sendKeys(editor, ["u", "u"]);
+      assert.equal(editor.getText(), "abcd");
+      sendKeys(editor, ["2", "\x1b[114;5u"]); // 2<kitty-C-r>
+      assert.equal(editor.getText(), "cd");
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Char-find motions — f / t / F / T / ; / ,
+// ---------------------------------------------------------------------------
+
+describe("char-find motions — f / F / t / T / ; / ,", () => {
+  it("f{char}: cursor moves to next occurrence of char", () => {
+    // "hello world" col 0, fo → cursor to col 4 ('o')
+    // verify via x: delete 'o' at col 4
+    chk("hello world", ["f", "o", "x"], "hell world", "o");
+  });
+
+  it("t{char}: cursor moves to one before char", () => {
+    // "hello world" col 0, to → cursor to col 3 ('l'), x deletes 'l'
+    chk("hello world", ["t", "o", "x"], "helo world", "l");
+  });
+
+  it("F{char}: cursor moves backward to char", () => {
+    // "aba" col 0→2 (ll), Fa → cursor to col 0, x deletes 'a'
+    chk("aba", ["l", "l", "F", "a", "x"], "ba", "a");
+  });
+
+  it("T{char}: cursor moves to one after backward target", () => {
+    // "abcde" col 4 (press e for end), Tb → finds 'b' at col 1, returns col 2
+    // x at col 2 deletes 'c' → "abde"
+    chk("abcde", ["e", "T", "b", "x"], "abde", "c");
+  });
+
+  it("; repeats last f motion forward", () => {
+    // "hello world" col 0: fo → col 4 ('o'); ; → next 'o' col 7; x
+    chk("hello world", ["f", "o", ";", "x"], "hello wrld", "o");
+  });
+
+  it(", reverses last f motion", () => {
+    // "hello world" col 0: fo → col 4; ; → col 7; , → back to col 4; x
+    chk("hello world", ["f", "o", ";", ",", "x"], "hell world", "o");
+  });
+
+  it("f{char} with operator: df{char} deletes to char (inclusive)", () => {
+    // "hello world" col 0, dfo → deletes "hello" (col 0..4 inclusive)
+    chk("hello world", ["d", "f", "o"], " world", "hello");
+  });
+
+  it("t{char} with operator: dt{char} deletes up to char (exclusive)", () => {
+    // "hello world" col 0, dto → deletes "hell" (col 0..3, not 'o')
+    chk("hello world", ["d", "t", "o"], "o world", "hell");
+  });
+
+  it("f{char} handles an emoji before the target", () => {
+    const { editor } = createEditorWithSpy("😀xy");
+
+    sendKeys(editor, ["f", "y"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 3 });
+  });
+
+  it("T{char} at EOL lands at line end instead of crashing", () => {
+    const { editor } = createEditorWithSpy("abc");
+
+    sendKeys(editor, ["$", "T", "c"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 3 });
+  });
+
+  it("T{char} after an emoji target at EOL lands safely", () => {
+    const { editor } = createEditorWithSpy("ab😀");
+
+    sendKeys(editor, ["$", "T", "😀"]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 4 });
+  });
+
+  it("f{char} accepts a single grapheme made of multiple code points", () => {
+    const target = "e\u0301";
+    const { editor } = createEditorWithSpy(`x${target}y`);
+
+    sendKeys(editor, ["f", target]);
+
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 1 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Operator cancellation / edge safety
+// ---------------------------------------------------------------------------
+
+describe("operator cancellation", () => {
+  it("Escape cancels pending operator without mutation", () => {
+    const { editor } = createEditorWithSpy("hello");
+    const before = editor.getText();
+    sendKeys(editor, ["d"]); // pendingOperator = 'd'
+    sendKeys(editor, ["\x1b"]); // cancel
+    assert.equal(editor.getText(), before);
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("Escape cancels pending motion without mutation", () => {
+    const { editor } = createEditorWithSpy("hello");
+    const before = editor.getText();
+    sendKeys(editor, ["f"]); // pendingMotion = 'f'
+    sendKeys(editor, ["\x1b"]); // cancel
+    assert.equal(editor.getText(), before);
+  });
+
+  it("unrecognised key after d operator cancels cleanly", () => {
+    const { editor } = createEditorWithSpy("hello");
+    const before = editor.getText();
+    sendKeys(editor, ["d", "z"]); // 'z' is not a valid motion
+    assert.equal(editor.getText(), before);
+  });
+
+  it("invalid delete motion does not stay sticky", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+    const before = editor.getText();
+
+    // If d stays pending after z, next w would delete instead of move.
+    sendKeys(editor, ["d", "z", "w"]);
+    assert.equal(editor.getText(), before);
+  });
+
+  it("invalid change motion does not stay sticky", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+    const before = editor.getText();
+
+    // If c stays pending after z, next w would change/delete unexpectedly.
+    sendKeys(editor, ["c", "z", "w"]);
+    assert.equal(editor.getText(), before);
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("printable chunk cancels df target wait without insertion", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+
+    // After d f, pasted printable chunks should cancel the wait and be ignored.
+    // If operator stays sticky or text is inserted, final state differs.
+    sendKeys(editor, ["d", "f", "ab", "w", "x"]);
+
+    assert.equal(editor.getText(), "foo ar");
+    assert.equal(editor.getRegister(), "b");
+  });
+
+  it("bracketed paste chunk cancels df target wait", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+
+    sendKeys(editor, ["d", "f", "\x1b[200~PASTE\x1b[201~", "w", "x"]);
+
+    assert.equal(editor.getText(), "foo ar");
+    assert.equal(editor.getRegister(), "b");
+  });
+
+  it("split bracketed paste cancels df target wait", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+
+    sendKeys(editor, ["d", "f", "\x1b[200~", "PASTE", "\x1b[201~", "w", "x"]);
+
+    assert.equal(editor.getText(), "foo ar");
+    assert.equal(editor.getRegister(), "b");
+  });
+
+  it("double-escape recovers from unterminated bracketed paste discard mode", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+
+    sendKeys(editor, ["\x1b[200~", "\x1b", "\x1b", "w", "x"]);
+
+    assert.equal(editor.getText(), "foo ar");
+    assert.equal(editor.getRegister(), "b");
+  });
+
+  it("double-escape recovery does not forward escape upward", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+
+    const customEditorProto = Object.getPrototypeOf(
+      Object.getPrototypeOf(editor),
+    );
+    const originalHandleInput = customEditorProto.handleInput;
+    let forwardedEscapeCount = 0;
+
+    customEditorProto.handleInput = function (
+      this: unknown,
+      data: string,
+    ): unknown {
+      if (data === "\x1b") forwardedEscapeCount++;
+      return originalHandleInput.call(this, data);
+    };
+
+    try {
+      sendKeys(editor, ["\x1b[200~", "\x1b", "\x1b"]);
+      assert.equal(forwardedEscapeCount, 0);
+    } finally {
+      customEditorProto.handleInput = originalHandleInput;
+    }
+  });
+
+  it("split bracketed paste end marker closes discard state", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+
+    sendKeys(editor, ["\x1b[200~", "PASTE", "\x1b", "[201~", "w", "x"]);
+
+    assert.equal(editor.getText(), "foo ar");
+    assert.equal(editor.getRegister(), "b");
+  });
+
+  it("non-printable input cancels df target wait without stickiness", () => {
+    const { editor } = createEditorWithSpy("foo bar");
+    const before = editor.getText();
+
+    // After d f, a non-printable key must cancel the pending operator+motion.
+    // If it stays sticky, the next w would delete.
+    sendKeys(editor, ["d", "f", "\x1b[C", "w"]);
+
+    assert.equal(editor.getText(), before);
+    assert.equal(editor.getRegister(), "");
+  });
+
+  it("non-printable invalid motion is passed through after cancel", () => {
+    const { editor } = createEditorWithSpy("abc");
+
+    // d + RightArrow should cancel d and still move right.
+    // Then x should delete 'b' (not 'a').
+    sendKeys(editor, ["d", "\x1b[C", "x"]);
+
+    assert.equal(editor.getText(), "ac");
+    assert.equal(editor.getRegister(), "b");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Anti-brittleness regression: no recursive delete handler re-entry
+// ---------------------------------------------------------------------------
+
+describe("regression — delete handler recursion", () => {
+  it("D repeatedly does not recurse or overflow call stack", () => {
+    const { editor } = createMultiLineEditor("alpha\nbeta\ngamma");
+
+    assert.doesNotThrow(() => {
+      for (let i = 0; i < 12; i++) {
+        sendKeys(editor, ["D"]);
+      }
+    });
+
+    // If recursion reappears, this test typically throws RangeError before here.
+    assert.ok(editor.getText().length >= 0);
+  });
+});
+
+describe("additional count combinations", () => {
+  it("d2k deletes current line and two above", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc\nd\ne");
+    sendKeys(editor, ["j", "j", "j", "d", "2", "k"]);
+    assert.equal(editor.getText(), "a\ne");
+    assert.equal(editor.getRegister(), "b\nc\nd\n");
+  });
+
+  it("d2j from middle of line deletes properly", () => {
+    const { editor } = createMultiLineEditor("abc\ndef\nghi\njkl");
+    sendKeys(editor, ["l", "d", "2", "j"]);
+    assert.equal(editor.getText(), "jkl");
+  });
+
+  it("d2d deletes two lines just like 2dd", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc");
+    sendKeys(editor, ["d", "2", "d"]);
+    assert.equal(editor.getText(), "c");
+    assert.equal(editor.getRegister(), "a\nb\n");
+  });
+
+  it("2j moves cursor down two lines (counted navigation)", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc\nd");
+    sendKeys(editor, ["2", "j", "x"]);
+    assert.equal(editor.getText(), "a\nb\n\nd");
+  });
+
+  it("2dG cancels cleanly and swallows G because it is printable", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc");
+    sendKeys(editor, ["2", "d", "G", "x"]);
+    // Since 2dG is canceled, G is swallowed, and we just execute x on line 0
+    assert.equal(editor.getText(), "\nb\nc");
+    assert.equal(editor.getRegister(), "a");
+  });
+});
+
+describe("surrogate pair / buffer replacement regression", () => {
+  it("dd deletes only the current line when it contains surrogate pairs", () => {
+    const { editor } = createEditorWithSpy("");
+    (
+      editor as unknown as {
+        state: { lines: string[]; cursorLine: number; cursorCol: number };
+      }
+    ).state = {
+      lines: ["😀x", "keep"],
+      cursorLine: 0,
+      cursorCol: 0,
+    };
+    sendKeys(editor, ["d", "d"]);
+    assert.equal(editor.getRegister(), "😀x\n");
+    assert.equal(editor.getText(), "keep");
+  });
+
+  it("9x on multiline buffer does not cross newline", () => {
+    const { editor } = createEditorWithSpy("");
+    (
+      editor as unknown as {
+        state: { lines: string[]; cursorLine: number; cursorCol: number };
+      }
+    ).state = {
+      lines: ["ab", "cd"],
+      cursorLine: 0,
+      cursorCol: 0,
+    };
+    sendKeys(editor, ["9", "x"]);
+    assert.equal(editor.getText(), "\ncd");
+  });
+
+  it("x deletes a surrogate pair without corrupting the buffer", () => {
+    const { editor } = createEditorWithSpy("😀x");
+    sendKeys(editor, ["x"]);
+    assert.equal(editor.getText(), "x");
+    assert.equal(editor.getRegister(), "😀");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Underscore motion — _ (first non-whitespace, linewise with operators)
+// ---------------------------------------------------------------------------
+
+describe("underscore motion — _ (first non-whitespace)", () => {
+  it("_ moves to first non-whitespace char on indented line", () => {
+    const { editor } = createEditorWithSpy("   hello");
+    sendKeys(editor, ["_"]);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 3 });
+  });
+
+  it("_ on line with no leading whitespace stays at col 0", () => {
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["_"]);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+  });
+
+  it("_ from mid-line moves back to first non-whitespace", () => {
+    const { editor } = createEditorWithSpy("   hello world");
+    sendKeys(editor, ["w", "w"]);
+    sendKeys(editor, ["_"]);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 3 });
+  });
+
+  it("_ stays in normal mode", () => {
+    const { editor } = createEditorWithSpy("   hello");
+    sendKeys(editor, ["_"]);
+    assert.equal(editor.getMode(), "normal");
+  });
+});
+
+describe("counted underscore motion — {count}_", () => {
+  it("2_ moves down one line then to first non-whitespace", () => {
+    const { editor } = createMultiLineEditor("foo\n   bar\nbaz");
+    sendKeys(editor, ["2", "_"]);
+    assert.deepEqual(editor.getCursor(), { line: 1, col: 3 });
+  });
+
+  it("1_ is same as plain _", () => {
+    const { editor } = createEditorWithSpy("   hello");
+    sendKeys(editor, ["1", "_"]);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 3 });
+  });
+
+  it("counted _ clamps at last line", () => {
+    const { editor } = createMultiLineEditor("foo\n   bar");
+    sendKeys(editor, ["9", "_"]);
+    assert.deepEqual(editor.getCursor(), { line: 1, col: 3 });
+  });
+
+  it("3_ skips wrapped visual rows and lands on the target logical line", () => {
+    const wrappedLine = "x".repeat(200);
+    const { editor } = createMultiLineEditor(`top\n${wrappedLine}\n  bottom`);
+    sendKeys(editor, ["3", "_"]);
+    assert.deepEqual(editor.getCursor(), { line: 2, col: 2 });
+  });
+});
+
+describe("operator + underscore — d_ / c_ / y_ (linewise)", () => {
+  it("d_ deletes entire current line (linewise)", () => {
+    const { editor } = createMultiLineEditor("hello\nworld\nfoo");
+    sendKeys(editor, ["d", "_"]);
+    assert.equal(editor.getText(), "world\nfoo");
+    assert.equal(editor.getRegister(), "hello\n");
+  });
+
+  it("d3_ deletes 3 lines", () => {
+    const { editor } = createMultiLineEditor("a\nb\nc\nd\ne");
+    sendKeys(editor, ["d", "3", "_"]);
+    assert.equal(editor.getText(), "d\ne");
+    assert.equal(editor.getRegister(), "a\nb\nc\n");
+  });
+
+  it("c_ changes current line and enters insert mode", () => {
+    const { editor } = createMultiLineEditor("hello\nworld");
+    sendKeys(editor, ["c", "_"]);
+    assert.equal(editor.getMode(), "insert");
+    // Line content should be cleared but line preserved
+  });
+
+  it("y_ yanks current line without mutation", () => {
+    const { editor } = createMultiLineEditor("hello\nworld");
+    const before = editor.getText();
+    sendKeys(editor, ["y", "_"]);
+    assert.equal(editor.getRegister(), "hello\n");
+    assert.equal(editor.getText(), before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Replace — r{char}
+// ---------------------------------------------------------------------------
+
+describe("replace — r{char}", () => {
+  it("ra replaces char at cursor", () => {
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["r", "a"]);
+    assert.equal(editor.getText(), "aello");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+  });
+
+  it("r replaces char in middle of word", () => {
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["l", "l", "r", "x"]);
+    assert.equal(editor.getText(), "hexlo");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 2 });
+  });
+
+  it("r replaces a surrogate pair without splitting it", () => {
+    const { editor } = createEditorWithSpy("😀x");
+    sendKeys(editor, ["r", "a"]);
+    assert.equal(editor.getText(), "ax");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+  });
+
+  it("r accepts a single grapheme made of multiple code points", () => {
+    const replacement = "e\u0301";
+    const { editor } = createEditorWithSpy("abc");
+    sendKeys(editor, ["r", replacement]);
+    assert.equal(editor.getText(), `${replacement}bc`);
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+  });
+
+  it("3rx replaces 3 chars", () => {
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["3", "r", "x"]);
+    assert.equal(editor.getText(), "xxxlo");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 2 });
+  });
+
+  it("r + Escape cancels", () => {
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["r", "\x1b"]);
+    assert.equal(editor.getText(), "hello");
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("5rx on short line cancels (not enough chars)", () => {
+    const { editor } = createEditorWithSpy("hi");
+    sendKeys(editor, ["5", "r", "x"]);
+    assert.equal(editor.getText(), "hi");
+  });
+
+  it("r stays in normal mode", () => {
+    const { editor } = createEditorWithSpy("hello");
+    sendKeys(editor, ["r", "a"]);
+    assert.equal(editor.getMode(), "normal");
+  });
+
+  it("r does not affect register", () => {
+    const { editor } = createEditorWithSpy("hello");
+    editor.setRegister("untouched");
+    sendKeys(editor, ["r", "a"]);
+    assert.equal(editor.getRegister(), "untouched");
+  });
+});
