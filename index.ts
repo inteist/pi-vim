@@ -2243,6 +2243,9 @@ export class ModalEditor extends CustomEditor {
 
     if (this.isPrintableChunk(data)) return;
     super.handleInput(data);
+    if (this.isEnterLikeInput(data)) {
+      this.setMode();
+    }
   }
 
   private openLineBelow(): void {

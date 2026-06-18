@@ -904,7 +904,7 @@ describe("mode transitions", () => {
 
     assert.equal(submitted, "hello");
     assert.equal(editor.getText(), "");
-    assert.equal(editor.getMode(), "normal");
+    assert.equal(editor.getMode(), "insert");
   });
 
   it("insert mode keeps bracketed paste payload text", () => {
